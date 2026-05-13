@@ -1,0 +1,14 @@
+torch
+torch-geometric
+numpy
+pandas
+networkx
+scipy
+pydeseq2
+GEOparse
+matplotlib
+seaborn
+gseapy
+requests
+scikit-learn
+python-louvain

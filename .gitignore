@@ -1,0 +1,26 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large data files
+data/9606.protein.info.v12.0.txt.gz
+data/9606.protein.links.v12.0.txt.gz
+data/BIOGRID-ORGANISM-Homo_sapiens-4.4.227.tab3.txt
+data/GSE11121_family.soft.gz
+data/biogrid_human.zip
+
+# MacOS
+.DS_Store
+
+# Output files
+out/
