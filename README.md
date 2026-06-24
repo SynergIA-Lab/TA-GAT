@@ -46,3 +46,6 @@ python main.py
 ## Notas
 
 El script descargará automáticamente los datasets de GEO y las bases de datos de BioGRID/STRING la primera vez que se ejecute si no están presentes en la carpeta `data/`.
+
+
+TA-GAT Link: https://nas.synergialab.eu/s/ZEf2WWnmmbKfKaF
