@@ -3,9 +3,24 @@ import GEOparse
 from pathlib import Path
 from config import CFG, DATA_DIR, NEW_IMPL_DIR
 
-def parse_geo_metadata(gse):
+##################################################
+# PHASE 1: GEO METADATA PARSING & EXTRACTION    #
+##################################################
+
+def parse_geo_metadata(gse: GEOparse.GSE) -> dict[str, list[str]]:
     """
-    Extrae propiedades y sus valores únicos a partir de characteristics_ch1.
+    Parses structural metadata fields and their unique values from GEO GSM objects.
+
+    Iterates through the sample records within the GEO dataset, extracts key-value 
+    pairs from the 'characteristics_ch1' metadata, and aggregates the unique clinical 
+    or experimental values available for cohort partitioning.
+
+    Args:
+        gse (GEOparse.GSE): The GSE object representing the downloaded GEO study.
+
+    Returns:
+        dict[str, list[str]]: A dictionary mapping metadata property keys to a list 
+            of their unique available categorical values.
     """
     props = {}
     for gsm_name, gsm in gse.gsms.items():
@@ -25,7 +40,37 @@ def parse_geo_metadata(gse):
                 props[key].add(c.strip())
     return {k: list(v) for k, v in props.items() if len(v) > 0}
 
-def run_interactive_setup():
+##################################################
+# PHASE 2: INTERACTIVE COHORT CONFIGURATION      #
+##################################################
+
+def run_interactive_setup() -> tuple[Path, Path]:
+    """
+    Launches an interactive command-line setup wizard to configure the GEO dataset.
+
+    Prompts the user to input a GSE Accession ID, downloads the corresponding dataset, 
+    displays all detected metadata properties, and guides the user in selecting 
+    the grouping variable. It then prompts for group assignment values to split 
+    samples into 'Normal' (reference control) and 'Tumor' (case) cohorts.
+    Creates and returns output and figure directories.
+
+    Returns:
+        tuple[Path, Path]: A tuple containing:
+            - out_dir (Path): The output directory path for saving execution logs and TSV matrices.
+            - figures_dir (Path): The directory path for saving generated network figures.
+    """
+    if os.environ.get("AUTOMATED") == "1":
+        CFG.GEO_ID = "GSE11121"
+        out_dir = NEW_IMPL_DIR / "out" / CFG.GEO_ID
+        figures_dir = out_dir / "figures"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        CFG.GEO_METADATA_KEY = "grade"
+        CFG.GEO_GROUPS = {"Tumor": ["3"], "Normal": ["1"]}
+        CFG.GEO_CONTROL_GROUP = "Normal"
+        print("[AUTOMATED] Running in automated mode with GSE11121, splitting by 'grade' (Tumor: [3], Normal: [1])")
+        return out_dir, figures_dir
+
     print("=" * 60)
     print("   CONFIGURACIÓN INTERACTIVA DEL CONJUNTO DE DATOS (GEO)   ")
     print("=" * 60)
@@ -37,7 +82,6 @@ def run_interactive_setup():
     
     CFG.GEO_ID = geo_id
     
-    # Directorios base dinámicos
     out_dir = NEW_IMPL_DIR / "out" / CFG.GEO_ID
     figures_dir = out_dir / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)

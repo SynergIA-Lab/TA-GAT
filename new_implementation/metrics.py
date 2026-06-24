@@ -4,9 +4,24 @@ from scipy.stats import linregress
 from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score, roc_curve, auc
 import matplotlib.pyplot as plt
 
+##################################################
+# PHASE 1: NETWORK TOPOLOGICAL PROPERTIES       #
+##################################################
+
 def compute_scale_free_fit(G: nx.Graph) -> float:
     """
-    Calcula el ajuste (R^2) a una distribución Scale-Free (Ley de potencias).
+    Computes the R-squared (R2) fit of the network's degree distribution to a power law.
+
+    Fits the log10-transformed degree frequency histogram against the log10-transformed 
+    degrees using simple linear regression. A higher R2 score indicates a higher 
+    scale-free topology alignment.
+
+    Args:
+        G (nx.Graph): The network graph to analyze.
+
+    Returns:
+        float: The R-squared coefficient of determination. Returns 0.0 if the graph 
+            has fewer than two unique degree values.
     """
     degrees = [d for n, d in G.degree()]
     if not degrees:
@@ -29,24 +44,34 @@ def compute_scale_free_fit(G: nx.Graph) -> float:
     slope, intercept, r_value, p_value, std_err = linregress(x, y)
     return float(r_value ** 2)
 
-def compute_network_topology_metrics(G: nx.Graph) -> dict:
+def compute_network_topology_metrics(G: nx.Graph) -> dict[str, any]:
     """
-    Calcula un set completo de métricas topológicas para una red biológica.
+    Computes a comprehensive set of topological metrics for a given network.
+
+    Calculates fundamental network metrics including node and edge count, 
+    average node degree, average clustering coefficient, network density, 
+    scale-free power-law fit (R2), and the diameter of the largest connected component (LCC).
+
+    Args:
+        G (nx.Graph): The network graph to analyze.
+
+    Returns:
+        dict[str, any]: A dictionary containing the following calculated metrics:
+            - 'Nodes' (int): Total number of nodes.
+            - 'Edges' (int): Total number of edges.
+            - 'Scale-Free R²' (float): Power-law fit R2 score.
+            - 'Avg Degree' (float): Mean degree of the nodes.
+            - 'Clustering Coef' (float): Average local clustering coefficient.
+            - 'Diameter (LCC)' (int): Diameter of the largest connected component.
+            - 'Density' (float): Global edge density.
     """
     num_nodes = G.number_of_nodes()
     num_edges = G.number_of_edges()
     
-    # 1. Ajuste Scale-Free R2
     r2 = compute_scale_free_fit(G)
-    
-    # 2. Grado medio
     avg_degree = (2 * num_edges / num_nodes) if num_nodes > 0 else 0
-    
-    # 3. Coeficiente de clustering medio
-    # Si la red es muy densa esto puede ser lento, pero con ~50k aristas es OK.
     avg_clustering = nx.average_clustering(G)
     
-    # 4. Diámetro (sobre el componente conexo más grande para evitar infinitos)
     if num_nodes > 0 and num_edges > 0:
         largest_cc = max(nx.connected_components(G), key=len)
         G_sub = G.subgraph(largest_cc)
@@ -54,7 +79,6 @@ def compute_network_topology_metrics(G: nx.Graph) -> dict:
     else:
         diameter = 0
         
-    # 5. Densidad
     density = nx.density(G)
 
     return {
@@ -67,29 +91,48 @@ def compute_network_topology_metrics(G: nx.Graph) -> dict:
         "Density": density
     }
 
-def evaluate_against_gold_standard(pred_adj: np.ndarray, truth_adj: np.ndarray, gene_names: list, evaluable_genes_set: set) -> dict:
+##################################################
+# PHASE 2: GOLD STANDARD VALIDATION & BENCHMARKS#
+##################################################
+
+def evaluate_against_gold_standard(pred_adj: np.ndarray, truth_adj: np.ndarray, gene_names: list[str], evaluable_genes_set: set[str]) -> dict[str, any]:
     """
-    [STRICT EVALUATION]: Solo considera la sub-red formada por genes que existen
-    tanto en la lista de DEGs como en el Gold Standard. Esto asegura que no estemos
-    evaluando aristas donde no tenemos información de 'verdad' (truth).
+    Evaluates a predicted network against an experimental gold standard.
+
+    Implements the 'Fair Evaluation' methodology, restricting all confusion matrix 
+    calculations (TP, FP, TN, FN) to the sub-network of genes present in both 
+    the local differentially expressed gene list and the gold standard reference set.
+    Computes Accuracy, Precision, Recall, and F1-Score.
+
+    Args:
+        pred_adj (np.ndarray): Binary predicted adjacency matrix of shape (num_genes, num_genes).
+        truth_adj (np.ndarray): Binary gold standard adjacency matrix of shape (num_genes, num_genes).
+        gene_names (list[str]): List of gene names corresponding to the indices of the adjacency matrices.
+        evaluable_genes_set (set[str]): Set of gene names present in both the DEGs and the gold standard.
+
+    Returns:
+        dict[str, any]: A dictionary containing:
+            - 'Accuracy' (float): Fraction of correctly predicted edges and non-edges.
+            - 'Precision' (float): Fraction of predicted edges that are true.
+            - 'Recall' (float): Fraction of true edges that are predicted.
+            - 'F1-Score' (float): Harmonic mean of Precision and Recall.
+            - 'Pred_Edges' (int): Count of predicted edges in the sub-network.
+            - 'True_Edges' (int): Count of true edges in the sub-network.
+            - 'Common_Genes' (int): Count of evaluable genes.
     """
-    # 1. Identificar índices de los genes que están en el Gold Standard
     eval_indices = [i for i, g in enumerate(gene_names) if g in evaluable_genes_set]
     
     if len(eval_indices) < 2:
         return {"Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0, "Pred_Edges": 0, "True_Edges": 0, "Common_Genes": 0}
     
-    # 2. Extraer sub-matrices
     sub_pred = pred_adj[np.ix_(eval_indices, eval_indices)]
     sub_truth = truth_adj[np.ix_(eval_indices, eval_indices)]
     
-    # 3. Solo triángulo superior
     upper_mask = np.triu(np.ones_like(sub_truth, dtype=bool), k=1)
     
     y_pred = sub_pred[upper_mask].astype(int)
     y_true = sub_truth[upper_mask].astype(int)
     
-    # 4. Cálculo métricas
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
@@ -105,10 +148,19 @@ def evaluate_against_gold_standard(pred_adj: np.ndarray, truth_adj: np.ndarray, 
         "Common_Genes": len(eval_indices)
     }
 
-def print_final_summary_tables(all_results: dict):
+def print_final_summary_tables(all_results: dict[str, any]):
     """
-    Imprime tablas finales comparativas usando Pandas para mayor legibilidad.
-    all_results: { 'Tumor': { 'BioGRID': { model: metrics, ... }, 'STRING': {...}, 'Topology': {...} }, 'Normal': ... }
+    Prints consolidated comparative performance and topology summary tables.
+
+    Uses Pandas to format and output two summary tables to stdout:
+    1. A performance table comparing model accuracy, precision, recall, and F1-score 
+       across conditions (e.g., Tumor, Normal) and Gold Standards (e.g., BioGRID, STRING).
+    2. A topological table comparing node/edge counts, average degree, clustering, 
+       diameter, and scale-free fit (R2) for all model networks.
+
+    Args:
+        all_results (dict[str, any]): Nested dictionary storing evaluation results 
+            structured as: {condition: {gold_standard_name: {model_name: metrics_dict}, 'Topology': {model_name: topology_dict}}}.
     """
     import pandas as pd
     
@@ -116,7 +168,6 @@ def print_final_summary_tables(all_results: dict):
     print(f"{' '*20} RESUMEN FINAL DE BENCHMARKS")
     print(f"{'#'*70}")
     
-    # 1. Tabla de Rendimiento Biológico (Precision, Recall, Accuracy)
     rows = []
     for condition, gs_data in all_results.items():
         for gs_name in ["BioGRID", "STRING", "GeneMANIA"]:
@@ -136,7 +187,6 @@ def print_final_summary_tables(all_results: dict):
     print("\n[TABLA 1: RENDIMIENTO VS GOLD STANDARDS (SUB-RED COMÚN)]")
     print(df_perf.to_string(index=False))
     
-    # 2. Tabla de Topología (Métricas extendidas)
     rows_topo = []
     for condition, gs_data in all_results.items():
         topo_data = gs_data.get("Topology", {})
@@ -157,17 +207,28 @@ def print_final_summary_tables(all_results: dict):
     print(df_topo.to_string(index=False))
     print(f"\n{'#'*70}\n")
 
-def print_evaluation_report(models_dict: dict, 
-                            truth_adj: np.ndarray, 
-                            gene_names: list,
-                            evaluable_genes: set,
-                            gs_name: str,
-                            condition: str):
-
-
+def print_evaluation_report(models_dict: dict[str, np.ndarray], 
+                             truth_adj: np.ndarray, 
+                             gene_names: list[str],
+                             evaluable_genes: set[str],
+                             gs_name: str,
+                             condition: str):
     """
-    Compara las métricas topológicas y biológicas de múltiples redes (Pearson, Spearman, TA-GAT, etc.)
-    frente a un Gold Standard específico.
+    Prints a detailed comparative evaluation report for a single gold standard.
+
+    Compares multiple models (Pearson, Spearman, ARACNE, WGCNA, and TA-GAT) 
+    against a specific reference network, reporting scale-free topology fit (R2), 
+    and performance statistics (accuracy, precision, recall, F1, and predicted edge count) 
+    restricted to the evaluable sub-network.
+
+    Args:
+        models_dict (dict[str, np.ndarray]): Dictionary mapping model names to their binary 
+            predicted adjacency matrices of shape (num_genes, num_genes).
+        truth_adj (np.ndarray): Binary gold standard adjacency matrix of shape (num_genes, num_genes).
+        gene_names (list[str]): List of gene names corresponding to the indices of the adjacency matrices.
+        evaluable_genes (set[str]): Set of gene names present in both the DEGs and the gold standard.
+        gs_name (str): Name of the gold standard reference database (e.g., 'BioGRID').
+        condition (str): The biological condition being evaluated (e.g., 'Tumor').
     """
     import networkx as nx
     
@@ -188,7 +249,6 @@ def print_evaluation_report(models_dict: dict,
         num_e = G_model.number_of_edges()
         print(f"  - {name}: R²={r2_model:.4f}, Nodes={num_n}, Edges={num_e}")
     
-    
     print(f"\n[Rendimiento Fair Evaluation sobre {len(evaluable_genes)} genes comunes con {gs_name}]")
     for name, adj in models_dict.items():
         eval_metrics = evaluate_against_gold_standard(adj, truth_adj, gene_names, evaluable_genes)
@@ -197,9 +257,35 @@ def print_evaluation_report(models_dict: dict,
     
     return
 
-def plot_roc_curves(models_scores: dict, truth_adj: np.ndarray, gene_names: list, evaluable_genes_set: set, condition: str, gs_name: str, dataset_name: str, save_dir):
+##################################################
+# PHASE 3: DIAGNOSTIC CURVES & ROC VISUALIZATIONS#
+##################################################
+
+def plot_roc_curves(models_scores: dict[str, np.ndarray], 
+                    truth_adj: np.ndarray, 
+                    gene_names: list[str], 
+                    evaluable_genes_set: set[str], 
+                    condition: str, 
+                    gs_name: str, 
+                    dataset_name: str, 
+                    save_dir: Path):
     """
-    Generate ROC curves for continuous predictions against the gold standard.
+    Generates and saves ROC curves comparing continuous edge scores against a gold standard.
+
+    Calculates the True Positive Rate (TPR) and False Positive Rate (FPR) at various 
+    thresholds for all models within the evaluable sub-network. Computes the Area 
+    Under the Curve (AUC) and saves the comparative plot as a high-resolution PNG file.
+
+    Args:
+        models_scores (dict[str, np.ndarray]): Dictionary mapping model names to their 
+            continuous predicted edge score matrices of shape (num_genes, num_genes).
+        truth_adj (np.ndarray): Binary gold standard adjacency matrix of shape (num_genes, num_genes).
+        gene_names (list[str]): List of gene names corresponding to the indices of the adjacency matrices.
+        evaluable_genes_set (set[str]): Set of gene names present in both the DEGs and the gold standard.
+        condition (str): The biological condition being evaluated (e.g., 'Tumor').
+        gs_name (str): Name of the gold standard reference database.
+        dataset_name (str): Accession ID of the dataset.
+        save_dir (Path): Output directory path where the plot figure will be saved.
     """
     plt.figure(figsize=(10, 8))
     eval_indices = [i for i, g in enumerate(gene_names) if g in evaluable_genes_set]
@@ -231,4 +317,3 @@ def plot_roc_curves(models_scores: dict, truth_adj: np.ndarray, gene_names: list
     plt.tight_layout()
     plt.savefig(save_dir / f"roc_{dataset_name.lower()}_{condition.lower()}_{gs_name.lower()}.png", dpi=300)
     plt.close()
-

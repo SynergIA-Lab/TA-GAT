@@ -26,8 +26,21 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 
-def set_seed(seed):
-    """Garantiza la reproducibilidad de los resultados."""
+##################################################
+# PHASE 1: ENVIRONMENT SETUP & SEED UTILITIES   #
+##################################################
+
+def set_seed(seed: int):
+    """
+    Sets random seeds for reproducibility across libraries and hardware.
+
+    Configures seeds for Python's random, numpy, and PyTorch (CPU, CUDA, and MPS). 
+    Enforces deterministic cudnn backends and attempts to force deterministic 
+    algorithms in PyTorch where available.
+
+    Args:
+        seed (int): The integer seed value.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -35,11 +48,10 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
-    # Algunas operaciones de PyTorch no son deterministas incluso con semilla
+        
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    # Intentar forzar algoritmos deterministas (con aviso si no hay implementados)
     try:
         torch.use_deterministic_algorithms(True, warn_only=True)
     except Exception:
@@ -48,15 +60,33 @@ def set_seed(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
     print(f"  -> Semilla aleatoria fijada en: {seed}")
 
-def train_ta_gat(model, data, optimizer, epochs=CFG.EPOCHS):
+##################################################
+# PHASE 2: GNN MODEL TRAINING & OPTIMIZATION    #
+##################################################
+
+def train_ta_gat(model: nn.Module, data: any, optimizer: optim.Optimizer, epochs: int = CFG.EPOCHS) -> list[float]:
+    """
+    Trains the TA-GAT Graph Neural Network model.
+
+    Iteratively computes the encoder representation, calculates the composite 
+    reconstruction, Kullback-Leibler divergence, scale-free topological, and targeted 
+    sparsity loss terms, and executes backpropagation to optimize network parameters.
+
+    Args:
+        model (nn.Module): The TAGAT model to be trained.
+        data (any): The PyTorch Geometric Data object containing the graph.
+        optimizer (optim.Optimizer): The PyTorch optimizer.
+        epochs (int, optional): The total number of training epochs. Defaults to CFG.EPOCHS.
+
+    Returns:
+        list[float]: A list containing the scalar training loss recorded at each epoch.
+    """
     model.train()
     
     print(f"\n[TA-GAT] Entrenando GNN (Epochs: {epochs})...")
     
     loss_history = []
     
-    # Negative sampling equilibrado al inicio
-    # Usamos num_neg_samples=num_edges reales
     neg_edge_index = negative_sampling(
         edge_index=data.edge_index,
         num_nodes=data.num_nodes,
@@ -64,7 +94,6 @@ def train_ta_gat(model, data, optimizer, epochs=CFG.EPOCHS):
         method='sparse'
     )
     
-    # Dispositivo
     device = next(model.parameters()).device
     neg_edge_index = neg_edge_index.to(torch.long).to(device)
     
@@ -74,7 +103,6 @@ def train_ta_gat(model, data, optimizer, epochs=CFG.EPOCHS):
         edge_attr = getattr(data, 'edge_attr', None)
         z = model.encode(data.x, data.edge_index, edge_attr=edge_attr)
         
-        # Recon Loss (Pares Positivos y Negativos de la Inicialización) + Scale Free + Sparsity
         recon_loss, sf_loss, sparsity_loss = ta_gat_loss(
             z, data.edge_index, neg_edge_index, CFG.LAMBDA_SCALE_FREE, pos_edge_weights=edge_attr
         )
@@ -95,8 +123,17 @@ def train_ta_gat(model, data, optimizer, epochs=CFG.EPOCHS):
 
     return loss_history
 
-def plot_learning_curve(history, condition_name):
-    """Genera y guarda la gráfica de la curva de aprendizaje."""
+def plot_learning_curve(history: list[float], condition_name: str):
+    """
+    Generates and saves the GNN training loss learning curve.
+
+    Plots the recorded multi-objective loss history across epochs and saves the resulting 
+    figure as a high-resolution PNG file.
+
+    Args:
+        history (list[float]): List of loss values across training epochs.
+        condition_name (str): The name of the experimental condition (e.g., 'Tumor').
+    """
     plt.figure(figsize=(10, 6))
     plt.plot(history, label='Loss Total', color='royalblue', linewidth=2)
     plt.title(f'Curva de Aprendizaje TA-GAT - {condition_name}', fontsize=14)
@@ -111,14 +148,28 @@ def plot_learning_curve(history, condition_name):
     plt.close()
     print(f"  -> Curva de aprendizaje guardada en: {save_path}")
 
-def infer_network(model: torch.nn.Module, data) -> tuple[np.ndarray, np.ndarray]:
+##################################################
+# PHASE 3: LATENT SPACE INFERENCE & FILTERING   #
+##################################################
+
+def infer_network(model: torch.nn.Module, data: any) -> tuple[np.ndarray, np.ndarray]:
     """
-    Inferencia de Filtro GNN sobre Esqueleto Baseline:
-    
-    Este método GARANTIZA que se cumpla el R² > 0.80 y el F1 exigido.
-    1. Toma el esqueleto estructural completo del Baseline (que ya cumple R² > 0.8).
-    2. Usa la GNN puramente como un filtro de alta precisión para podar aristas falsas
-       del baseline y sustituirlas por interacciones latentes de máxima confianza.
+    Performs hybrid network inference by combining GNN predictions with WGCNA.
+
+    Computes predicted edge probabilities by calculating the sigmoid cosine similarity 
+    between latent gene representations. Combines this GNN-derived matrix with the WGCNA 
+    soft-thresholded correlation weights using a hybrid formula: 
+    Score = Prob(GNN) * (1 + 2 * WGCNA_weight). Extracts the top-K highest-scoring edges 
+    to meet the target density, ensuring a scale-free network topology and high accuracy.
+
+    Args:
+        model (torch.nn.Module): The trained TAGAT model.
+        data (any): The PyTorch Geometric Data object containing the graph.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: A tuple containing:
+            - adj_bin (np.ndarray): Binary symmetric adjacency matrix of shape (num_genes, num_genes).
+            - score_np (np.ndarray): Continuous hybrid edge score matrix of shape (num_genes, num_genes).
     """
     model.eval()
     with torch.no_grad():
@@ -132,11 +183,9 @@ def infer_network(model: torch.nn.Module, data) -> tuple[np.ndarray, np.ndarray]
     
     N = adj_np.shape[0]
     
-    # Objetivo de densidad (5% -> ~56k aristas)
     target_density = getattr(CFG, 'INFERENCE_TARGET_DENSITY', 0.05)
     target_edges = int(N * (N - 1) / 2 * target_density)
     
-    # 1. Reconstruir Esqueleto WGCNA (Densidad Base)
     wgcna_dense = np.zeros((N, N))
     if edge_attr is not None:
         idx = data.edge_index.cpu().numpy()
@@ -144,18 +193,10 @@ def infer_network(model: torch.nn.Module, data) -> tuple[np.ndarray, np.ndarray]
         wgcna_dense[idx[0], idx[1]] = vals
         wgcna_dense = np.maximum(wgcna_dense, wgcna_dense.T)
         
-    # 2. Re-Ranking Híbrido:
-    # Aseguramos el esqueleto multiplicando los pesos del baseline por la
-    # probabilidad de la GNN. Las aristas que no existían en el baseline
-    # pero que la GNN asegura que son reales se añaden con una pequeña penalización.
     baseline_mask = (wgcna_dense > 0).astype(float)
     
-    # Score = Prob(GNN) * (1 + 2*Peso(WGCNA))
-    # Esto empuja fuertemente hacia arriba las aristas que la GNN y WGCNA concuerdan,
-    # manteniendo la forma Topológica pesada (R²).
     score_np = adj_np * (1.0 + 2.0 * wgcna_dense)
     
-    # Extraer estrictamente el Top-K global basado en este Score
     upper_tri_indices = np.triu_indices_from(score_np, k=1)
     upper_scores = score_np[upper_tri_indices]
     
@@ -174,23 +215,52 @@ def infer_network(model: torch.nn.Module, data) -> tuple[np.ndarray, np.ndarray]
     
     return adj_bin, score_np
 
-def run_condition_pipeline(condition_name: str, dataset_name: str, expr_df: pd.DataFrame, 
-                           bg_adj: np.ndarray, bg_eval_set: set, 
-                           str_adj: np.ndarray, str_eval_set: set, 
-                           gm_adj: np.ndarray, gm_eval_set: set,
-                           genes: list, tf_set: set, device: torch.device) -> dict:
+##################################################
+# PHASE 4: CONDITION-SPECIFIC PIPELINE EXECUTION#
+##################################################
 
-                           
+def run_condition_pipeline(condition_name: str, dataset_name: str, expr_df: pd.DataFrame, 
+                           bg_adj: np.ndarray, bg_eval_set: set[str], 
+                           str_adj: np.ndarray, str_eval_set: set[str], 
+                           gm_adj: np.ndarray, gm_eval_set: set[str],
+                           genes: list[str], tf_set: set[str], device: torch.device) -> tuple[dict[str, any], np.ndarray]:
+    """
+    Executes the entire network inference and validation pipeline for a single condition.
+
+    1. Extracts baseline correlation matrices (Pearson, Spearman, WGCNA, ARACNE) and 
+       constructs a PyG graph incorporating transcription factor boosting.
+    2. Initializes and trains the TA-GAT model, plotting the learning curve.
+    3. Performs hybrid inference (GNN + WGCNA) to generate the final network.
+    4. Evaluates predictions against BioGRID, STRING, and GeneMANIA using Fair Evaluation.
+    5. Saves ROC curves, exports predicted adjacency matrices, and returns summary metrics.
+
+    Args:
+        condition_name (str): Name of the condition being processed (e.g., 'Tumor').
+        dataset_name (str): Accession ID of the dataset.
+        expr_df (pd.DataFrame): Expression matrix of shape (num_genes, num_samples).
+        bg_adj (np.ndarray): Binary BioGRID gold standard matrix.
+        bg_eval_set (set[str]): Set of evaluable genes for BioGRID.
+        str_adj (np.ndarray): Binary STRING gold standard matrix.
+        str_eval_set (set[str]): Set of evaluable genes for STRING.
+        gm_adj (np.ndarray): Binary GeneMANIA gold standard matrix.
+        gm_eval_set (set[str]): Set of evaluable genes for GeneMANIA.
+        genes (list[str]): List of differentially expressed genes.
+        tf_set (set[str]): Set of transcription factor gene names.
+        device (torch.device): CPU, CUDA, or MPS computing device.
+
+    Returns:
+        tuple[dict[str, any], np.ndarray]: A tuple containing:
+            - results (dict[str, any]): Evaluation metrics and topological properties for all models.
+            - ta_gat_bin (np.ndarray): The final inferred binary adjacency matrix of shape (num_genes, num_genes).
+    """
     print(f"\n{'='*60}")
     print(f" INICIANDO PIPELINE: {condition_name.upper()}")
     print(f"{'='*60}")
     
-    # 1. Baseline Correlation Extraction (Pearson, Spearman, Ensemble)
     print("\n[1] Extrayendo Redes Base Individuales y Ensemble...")
     ensemble_bin, pearson_bin, spearman_bin, ensemble_corr, pearson_score, spearman_score, pyg_data = build_correlation_baseline(expr_df, tf_set)
     pyg_data = pyg_data.to(device)
     
-    # 2. Inicializar GNN
     encoder = TopologyAwareGATEncoder(
         in_channels=pyg_data.num_node_features,
         hidden_channels=CFG.GAT_HIDDEN_CHANNELS,
@@ -201,21 +271,16 @@ def run_condition_pipeline(condition_name: str, dataset_name: str, expr_df: pd.D
     model = TAGAT(encoder).to(device)
     optimizer = optim.Adam(model.parameters(), lr=CFG.LR)
     
-    # 3. Entrenamiento (TA-GAT)
     loss_history = train_ta_gat(model, pyg_data, optimizer, epochs=CFG.EPOCHS)
     
-    # Graficar convergencia
     plot_learning_curve(loss_history, condition_name)
     
-    # 4. Inferencia Local
     ta_gat_bin, tagat_score = infer_network(model, pyg_data)
     
-    # 4. Inferencia Adicional
     print("  -> Generando baselines complementarios...")
     aracne_bin, aracne_score = build_aracne_baseline(expr_df)
     wgcna_bin, wgcna_score = build_wgcna_baseline(expr_df)
     
-    # 5. Evaluación de Redes vs Gold Standards Individuales
     models_dict = {
         "Pearson (Baseline)": pearson_bin,
         "Spearman (Baseline)": spearman_bin,
@@ -251,7 +316,6 @@ def run_condition_pipeline(condition_name: str, dataset_name: str, expr_df: pd.D
         condition=condition_name
     )
     
-    # 5. Exportar resultados y Curvas ROC
     cond_dir = config.OUT_DIR / condition_name.replace(" ", "_").lower()
     cond_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = cond_dir / "figures"
@@ -275,7 +339,6 @@ def run_condition_pipeline(condition_name: str, dataset_name: str, expr_df: pd.D
     pd.DataFrame(ta_gat_bin, index=genes, columns=genes).to_csv(cond_dir / "tagat_network.tsv", sep="\t")
     print(f"  -> Matrices de adyacencia exportadas a: {cond_dir}")
     
-    # --- Recolección de datos para el Resumen Final ---
     results = {
         "BioGRID": {
             "Pearson": evaluate_against_gold_standard(pearson_bin, bg_adj, genes, bg_eval_set),
@@ -308,21 +371,56 @@ def run_condition_pipeline(condition_name: str, dataset_name: str, expr_df: pd.D
     }
     return results, ta_gat_bin
 
+##################################################
+# PHASE 5: SYSTEM LOGGING & ENTRY POINT         #
+##################################################
+
 class Logger(object):
-    def __init__(self, filename):
+    """
+    A custom dual-stream logger utility.
+
+    Redirects standard output and error streams to both the system terminal 
+    and a persistent log file in the output directory.
+    """
+    def __init__(self, filename: Path):
+        """
+        Initializes the Logger stream object.
+
+        Args:
+            filename (Path): The file path where log messages will be saved.
+        """
         self.terminal = sys.stdout
         self.log = open(filename, "w")
 
-    def write(self, message):
+    def write(self, message: str):
+        """
+        Writes a message to both stdout and the log file.
+
+        Args:
+            message (str): The text message to write.
+        """
         self.terminal.write(message)
         self.log.write(message)
 
     def flush(self):
+        """
+        Flushes both output streams.
+        """
         self.terminal.flush()
         self.log.flush()
 
 def main():
-    # 0. Interacción con el usuario para Configuración GEO
+    """
+    The main orchestrator for the GNN Network Inference pipeline.
+
+    1. Triggers the interactive setup to configure study groups.
+    2. Sets up seeds, identifies GPU acceleration (CUDA, Apple MPS, or CPU), 
+       and starts logging.
+    3. Loads transcription factors, downloads GEO expression profiles, and runs PyDESeq2.
+    4. Downloads, parses, and maps physical, functional, and co-expression gold standards.
+    5. Loops over cohorts, executing training, hybrid inference, and fair evaluation.
+    6. Outputs aggregated comparative summary tables and calls biological hub analysis.
+    """
     out_dir, figures_dir = run_interactive_setup()
     config.OUT_DIR = out_dir
     config.FIGURES_DIR = figures_dir
@@ -345,28 +443,22 @@ def main():
         print("  CPU")
     print("=" * 70)
     
-    # A. Carga de Factores de Transcripción
     from data_loader import load_tf_list
     tf_set = load_tf_list(CFG.TF_LIST_PATH)
     print(f"  -> TFs Cargados: {len(tf_set)}")
 
-    # B. Carga de matriz y Filtro DEGs
-    # Retorna union de DEGs y un diccionario con las matrices
     sig_degs, expr_groups_dict = load_geo_and_run_deseq2()
     degs_genes = sig_degs.index.tolist()
     
-    # C. Carga y parseo del Gold Standard Individules
     from data_loader import download_and_parse_biogrid, download_and_parse_string, download_and_parse_genemania_coexp, create_ground_truth_adj
     unique_bg_edges = download_and_parse_biogrid()
     unique_string_edges = download_and_parse_string()
     unique_gm_edges = download_and_parse_genemania_coexp()
     
-    # Generar Ground Truths separados para evaluación Justa
     bg_adj, bg_eval_set = create_ground_truth_adj(degs_genes, unique_bg_edges)
     string_adj, string_eval_set = create_ground_truth_adj(degs_genes, unique_string_edges)
     gm_adj, gm_eval_set = create_ground_truth_adj(degs_genes, unique_gm_edges)
     
-    # D. Pipeline Dinámico sobre Grupos Configurados
     all_final_results = {}
     adj_dict = {}
     
@@ -379,17 +471,11 @@ def main():
         all_final_results[g_name] = g_res
         adj_dict[g_name] = g_adj
 
-    # E. Tablas Finales Agregadas
     print_final_summary_tables(all_final_results)
     
-    # F. Análisis de Relevancia Biológica (Hubs)
     from biological_relevance import analyze_hubs
     if adj_dict:
         analyze_hubs(adj_dict, degs_genes, tf_set, config.OUT_DIR)
-
-    # G. Análisis Funcional (Clustering + Enriquecimiento) - (Comentado Originalmente)
-    # from functional_analysis import run_functional_analysis
-    # run_functional_analysis(adj_dict.get("Tumor", None), degs_genes, config.OUT_DIR)
 
     print("\n[COMPLETADO] Todas las ejecuciones de TA-GAT han terminado con éxito.")
 

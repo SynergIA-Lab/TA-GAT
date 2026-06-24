@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data
 import networkx as nx
+import requests
 
 import GEOparse
 from pydeseq2.dds import DeseqDataSet
@@ -19,51 +20,69 @@ from pydeseq2.default_inference import DefaultInference
 
 from config import CFG, DATA_DIR
 
-# =============================================================================
-# BioGRID Gold Standard Loader
-# =============================================================================
-
-def download_and_parse_biogrid() -> pd.DataFrame:
+def _download_file(url: str, dest_path: Path):
     """
-    Descarga la última release de BioGRID (Homo sapiens), localiza las
-    interacciones genéticas y físicas, y retorna un DataFrame estandarizado
-    de aristas reales.
+    Downloads a file from a URL to a local destination path using requests.
+    Uses a standard browser User-Agent header to bypass bot blocking.
+
+    Args:
+        url (str): The URL of the file to download.
+        dest_path (Path): The local destination path where the file will be saved.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    with requests.get(url, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+##################################################
+# PHASE 1: BIOGRID GOLD STANDARD EXTRACTION     #
+##################################################
+
+def download_and_parse_biogrid() -> set[tuple[str, str]]:
+    """
+    Downloads and parses the BioGRID interaction database.
+
+    Checks if the local BioGRID human-specific file exists. If not, it downloads the 
+    zip archive from the configured URL, extracts the tab3 text file, and parses it. 
+    It filters specifically for Homo sapiens genetic and physical interactions (TaxID 9606), 
+    eliminates self-loops, normalizes gene symbols to uppercase, and removes undirected 
+    edge duplicates by sorting pairs alphabetically.
+
+    Returns:
+        set[tuple[str, str]]: A set of unique, alphabetically sorted undirected 
+            gene interaction pairs (node1, node2) representing the BioGRID gold standard.
     """
     zip_path = DATA_DIR / "biogrid_human.zip"
     txt_path = DATA_DIR / f"{CFG.BIOGRID_FILE_MATCH}-4.4.227.tab3.txt"
     
     if not txt_path.exists():
         print("[BioGRID] Descargando base de datos Gold Standard (~40MB)...")
-        urllib.request.urlretrieve(CFG.BIOGRID_URL, zip_path)
+        _download_file(CFG.BIOGRID_URL, zip_path)
         
         print("[BioGRID] Extrayendo base de datos...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            # Extraer solo el archivo de Homo Sapiens
             for file_info in zip_ref.infolist():
                 if CFG.BIOGRID_FILE_MATCH in file_info.filename:
                     zip_ref.extract(file_info, DATA_DIR)
                     break
     
     print("[BioGRID] Parseando interacciones validadas experimentales...")
-    # Usamos low_memory=False y leemos columnas esenciales de BioGRID:
-    # Col 7 y 8: Official Symbol Interactor A & B
-    # Col 11: Experimental System Type (Física o Genética)
-    # Col 15: Organism ID Interactor A (9606 es humano)
     df_bg = pd.read_csv(txt_path, sep="\t", low_memory=False, usecols=[7, 8, 11, 15, 16])
     
-    # Filtrar solo interacciones puramente humanas
     df_bg = df_bg[(df_bg.iloc[:, 3] == 9606) & (df_bg.iloc[:, 4] == 9606)]
     
-    # Limpiamos y estandarizamos la red
     edges = df_bg.iloc[:, [0, 1]].dropna().astype(str)
     edges.columns = ["source", "target"]
     edges["source"] = edges["source"].str.upper()
     edges["target"] = edges["target"].str.upper()
     
-    # Quitar auto-bucles y duplicados para crear una adyacencia binaria simétrica limpia
     edges = edges[edges["source"] != edges["target"]]
     
-    # Ordenar A-B para eliminar (B, A) como red no dirigida
     edges["node1"] = np.where(edges["source"] < edges["target"], edges["source"], edges["target"])
     edges["node2"] = np.where(edges["source"] < edges["target"], edges["target"], edges["source"])
     unique_edges = set(zip(edges["node1"], edges["node2"]))
@@ -71,21 +90,33 @@ def download_and_parse_biogrid() -> pd.DataFrame:
     print(f"  -> BioGRID Red Cargada: {len(unique_edges)} aristas únicas válidas.")
     return unique_edges
 
+##################################################
+# PHASE 2: STRING GOLD STANDARD EXTRACTION       #
+##################################################
 
-def download_and_parse_string() -> set:
+def download_and_parse_string() -> set[tuple[str, str]]:
     """
-    Descarga STRING y mapea las proteínas a símbolos de genes (Hugo).
-    Filtra interacciones por score (medio/alto según config).
+    Downloads and parses the STRING protein-protein interaction database.
+
+    Downloads both the protein interaction links and protein information info files 
+    for Homo sapiens if not locally present. Parses protein descriptions to build a 
+    translation map from ENSP identifiers to HUGO Gene Symbols. Parses the interaction 
+    links, filtering pairs by the configured score threshold (e.g., >= 400). Self-loops 
+    are removed and pairs are alphabetically sorted to represent undirected edges.
+
+    Returns:
+        set[tuple[str, str]]: A set of unique, alphabetically sorted undirected 
+            gene interaction pairs (node1, node2) representing the STRING gold standard.
     """
     links_path = DATA_DIR / "9606.protein.links.v12.0.txt.gz"
     info_path  = DATA_DIR / "9606.protein.info.v12.0.txt.gz"
     
     if not links_path.exists():
         print("[STRING] Descargando BD de interacciones (~80MB)...")
-        urllib.request.urlretrieve(CFG.STRING_LINKS_URL, links_path)
+        _download_file(CFG.STRING_LINKS_URL, links_path)
     if not info_path.exists():
         print("[STRING] Descargando Info de proteínas...")
-        urllib.request.urlretrieve(CFG.STRING_INFO_URL, info_path)
+        _download_file(CFG.STRING_INFO_URL, info_path)
         
     print("[STRING] Parseando alias de proteínas a genes...")
     protein_to_gene = {}
@@ -117,21 +148,92 @@ def download_and_parse_string() -> set:
     print(f"  -> STRING Red Cargada: {len(unique_edges)} aristas únicas válidas.")
     return unique_edges
 
-def create_ground_truth_adj(genes: list, gs_edges: set) -> tuple[np.ndarray, set]:
+##################################################
+# PHASE 3: GENEMANIA GOLD STANDARD EXTRACTION   #
+##################################################
+
+def download_and_parse_genemania_coexp() -> set[tuple[str, str]]:
     """
-    Mapea un set de interacciones (BioGRID o STRING) a nuestra lista de genes DEGs.
-    Retorna:
-     1. La matriz binaria (G x G) de ground-truth.
-     2. El set de "Genes Evaluables" para FAIR EVALUATION.
+    Downloads and parses the GeneMANIA human co-expression databases.
+
+    Downloads the identifier mapping file if not locally present. Parses the mapping 
+    to map preferred names to HUGO Gene Symbols. Iterates through the list of 
+    configured co-expression network URLs, downloading and reading each. Extracts 
+    and translates interaction pairs, removing self-loops and sorting pairs 
+    alphabetically to represent undirected edges.
+
+    Returns:
+        set[tuple[str, str]]: A set of unique, alphabetically sorted undirected 
+            gene interaction pairs (node1, node2) representing the GeneMANIA gold standard.
     """
+    mappings_path = DATA_DIR / "genemania_identifier_mappings.txt"
+    if not mappings_path.exists():
+        print("[GeneMANIA] Descargando ID mappings (~11MB)...")
+        _download_file(CFG.GENEMANIA_ID_MAPPING_URL, mappings_path)
     
-    # ¿Qué genes realmente existen en este Gold Standard?
+    print("[GeneMANIA] Parseando ID Mappings (Preferred_Name to Gene Name)...")
+    pm_to_gene = {}
+    with open(mappings_path, "r", encoding="utf-8") as f:
+        f.readline()
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 3:
+                pname, name, source = parts[0], parts[1], parts[2]
+                if source == "Gene Name":
+                    pm_to_gene[pname] = name.upper()
+    
+    unique_edges = set()
+    print("[GeneMANIA] Procesando redes de Co-expresión superiores...")
+    for url in CFG.GENEMANIA_COEXP_URLS:
+        filename = url.split("/")[-1]
+        local_path = DATA_DIR / filename
+        if not local_path.exists():
+            print(f"  -> Descargando {filename} ...")
+            _download_file(url, local_path)
+        
+        with open(local_path, "r", encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    g1 = pm_to_gene.get(parts[0])
+                    g2 = pm_to_gene.get(parts[1])
+                    if g1 and g2 and g1 != g2:
+                        if g1 < g2:
+                            unique_edges.add((g1, g2))
+                        else:
+                            unique_edges.add((g2, g1))
+                            
+    print(f"  -> GeneMANIA Co-expression Red Cargada: {len(unique_edges)} aristas únicas válidas.")
+    return unique_edges
+
+##################################################
+# PHASE 4: GROUND TRUTH INTERSECTION & MAPPING  #
+##################################################
+
+def create_ground_truth_adj(genes: list[str], gs_edges: set[tuple[str, str]]) -> tuple[np.ndarray, set[str]]:
+    """
+    Maps a global gold standard edge set to the local differentially expressed genes.
+
+    Creates a binary ground truth adjacency matrix representing verified physical or 
+    functional interactions restricted to the local gene list. Also extracts the set 
+    of 'evaluable genes' (the intersection of the local gene list and the total genes 
+    present in the gold standard) for fair validation.
+
+    Args:
+        genes (list[str]): List of local gene names.
+        gs_edges (set[tuple[str, str]]): Set of unique gold standard interaction pairs.
+
+    Returns:
+        tuple[np.ndarray, set[str]]: A tuple containing:
+            - adj (np.ndarray): Binary symmetric adjacency matrix of shape (num_genes, num_genes).
+            - evaluable_genes_set (set[str]): Sub-set of local genes present in the gold standard.
+    """
     gold_genes = set()
     for u, v in gs_edges:
         gold_genes.add(u)
         gold_genes.add(v)
         
-    # Intersecar con nuestros DEGs
     evaluable_genes_set = gold_genes.intersection(set(genes))
     
     gene_map_idx = {g: i for i, g in enumerate(genes)}
@@ -145,22 +247,30 @@ def create_ground_truth_adj(genes: list, gs_edges: set) -> tuple[np.ndarray, set
             adj[gene_map_idx[v], gene_map_idx[u]] = 1.0
             edges_found += 1
             
-    # print(f"  -> Mapeo a DEGs locales: {edges_found} aristas GS halladas. ({len(evaluable_genes_set)} evaluables)")
-    
     return adj, evaluable_genes_set
 
+##################################################
+# PHASE 5: GEO DATA LOADING & DESEQ2 PROCESSING #
+##################################################
 
-
-# =============================================================================
-# GEO & PyDESeq2 Loaders
-# =============================================================================
-
-def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
+def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     """
-    Descarga GEO, mapea a metadata estricta por grupos configurados interactivamente.
-    Aplica PyDESeq2 y retorna:
-    - de_results: Tabla de resultados de DESeq2 (union de todos los DEGs)
-    - expr_dict: Diccionario de {nombre_grupo: DataFrame expresion (genes x muestras)}
+    Downloads expression data from GEO and runs PyDESeq2 to identify DEGs.
+
+    Downloads the specified GEO accession ID and parses sample metadata. Splitting 
+    GSM samples into cohorts based on the interactively configured variable, it 
+    downloads supplementary processed matrices if GSM tables are empty. Autodetects 
+    Ensembl IDs and queries the MyGene.info API in chunks to translate them to HUGO 
+    Gene Symbols. Rounds expression counts and executes PyDESeq2, contrasting the case 
+    cohort against the control cohort. Identifies differentially expressed genes (DEGs) 
+    using adjusted p-value and log2 fold-change cutoffs, capping the unified DEG count 
+    at 1500 to optimize memory. Returns the DEGs table and cohort-specific expression matrices.
+
+    Returns:
+        tuple[pd.DataFrame, dict[str, pd.DataFrame]]: A tuple containing:
+            - combined_degs (pd.DataFrame): Statistics table for the unified differentially expressed genes.
+            - expr_groups_dict (dict[str, pd.DataFrame]): Dictionary mapping cohort names to their 
+              respective expression matrices of shape (num_degs, num_cohort_samples).
     """
     geo_id = CFG.GEO_ID
     destdir = DATA_DIR
@@ -186,7 +296,6 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
                 key = key.strip()
                 val = val.strip()
                 if key == CFG.GEO_METADATA_KEY:
-                    # Buscar en CFG.GEO_GROUPS
                     for g_name, g_vals in CFG.GEO_GROUPS.items():
                         if val in g_vals or any(val == str(v).strip() for v in g_vals):
                             label = g_name
@@ -198,13 +307,11 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
     if not samples:
         print("\n[WARN] Las tablas GSM están vacías. Buscando matriz de expresión suplementaria en GEO...")
         
-        # Buscar archivo(s) suplementario(s)
         supp_files = []
         for k, v in gse.metadata.items():
             if k.startswith("supplementary_file"):
                 supp_files.extend(v)
                 
-        # Priorizar procesados
         valid_exts = (".csv.gz", ".tsv.gz", ".txt.gz", ".csv", ".tsv", ".txt")
         supp_url = next((url for url in supp_files if url.lower().endswith(valid_exts)), None)
         
@@ -212,29 +319,25 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
             print(f"  -> Descargando {supp_url} ...")
             local_supp = destdir / supp_url.split("/")[-1]
             if not local_supp.exists():
-                urllib.request.urlretrieve(supp_url, str(local_supp))
+                _download_file(supp_url, local_supp)
                 
             sep = "," if ".csv" in str(local_supp).lower() else "\t"
-            expr_df = pd.read_csv(local_supp, sep=sep, index_col=0)
+            expr_df = pd.read_csv(local_supp, index_col=0, sep=sep)
             
-            # Autodetectar orientación (genes son +5k), transponer si genes están en columnas
             if expr_df.shape[1] > 5000 and expr_df.shape[0] < 1000:
                 print("  -> Intercambiando la matriz (Muestras x Genes a Genes x Muestras)")
                 expr_df = expr_df.T
                 
-            # Mapear las columnas de expr_df a los IDs de muestras GSM
             mapping = {}
             for gsm_name, gsm in gse.gsms.items():
                 found = False
                 for vals in gsm.metadata.values():
                     if isinstance(vals, list):
                         for val in vals:
-                            # Match directo completo
                             if val in expr_df.columns:
                                 mapping[val] = gsm_name
                                 found = True
                                 break
-                            # Match parcial (substring cruce) si no hay directo
                             for col in expr_df.columns:
                                 if len(val) > 4 and (col in val or val in col):
                                     mapping[col] = gsm_name
@@ -245,7 +348,6 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
             if mapping:
                 expr_df.rename(columns=mapping, inplace=True)
                 
-            # Mapeo de Ensembl a Gene Symbol (Hugo)
             if any(str(idx).startswith("ENSG") for idx in expr_df.index[:20]):
                 print("  -> Autodetectados Ensembl IDs. Traduciendo a Gene Symbols mediante MyGene API...")
                 
@@ -275,7 +377,6 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
         expr_df.columns = names
         expr_df.dropna(inplace=True)
         
-        # Mapear Probe IDs
         if gse.gpls:
             gpl_name = list(gse.gpls.keys())[0]
             gpl = gse.gpls[gpl_name]
@@ -287,18 +388,16 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
     
                 expr_df.index = expr_df.index.map(gpl_dict)
                 expr_df.dropna(inplace=True)
-                expr_df = expr_df.groupby(expr_df.index).mean() # Promedio duplicados
+                expr_df = expr_df.groupby(expr_df.index).mean()
 
     meta_df = pd.DataFrame(meta_rows).set_index("gsm")
     
-    # Asegurarnos de usar solo las muestras que existen en expr_df
     common_samples = meta_df.index.intersection(expr_df.columns)
     expr_df = expr_df[common_samples]
     meta_df = meta_df.loc[common_samples]
         
     print(f"  -> Matriz bruta extraída y mapeada: {expr_df.shape}")
     
-    # ── PyDESeq2 ─────────────────────────────────────────────────────────────
     print("\n[PyDESeq2] Ejecutando Differential Expression Analysis...")
     counts_clean = expr_df.apply(pd.to_numeric, errors="coerce").fillna(0)
     
@@ -327,7 +426,7 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
     
     if len(groups_to_compare) == 0:
         print("[WARN] Solo se ha definido un grupo o no hay grupos contra los que comparar.")
-        combined_degs = pd.DataFrame(index=counts_clean.index.tolist()[:1000]) # dummy
+        combined_degs = pd.DataFrame(index=counts_clean.index.tolist()[:1000])
     else:    
         for case_group in groups_to_compare:
             print(f"  -> Contrastando {case_group} vs {control_group}...")
@@ -349,16 +448,13 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
 
         valid_degs = [df for df in all_sig_degs if len(df) > 0]
         if valid_degs:
-            # Union de todos los DEGs
             combined_degs = pd.concat(valid_degs)
             combined_degs = combined_degs[~combined_degs.index.duplicated(keep="first")]
         else:
-            # Si falla todo o no hay genes sig, coger top varianza o un set dummy
             print("[WARN] No se extrajeron DEGs de los contrastes. Usando los 500 genes mas variables.")
             variances = counts_clean.var(axis=1).sort_values(ascending=False).head(500)
             combined_degs = pd.DataFrame(index=variances.index)
             
-    # Capping DEGs size to avoid OOM
     if len(combined_degs) > 1500:
         if "padj" in combined_degs.columns:
             combined_degs = combined_degs.sort_values("padj").head(1500)
@@ -380,12 +476,23 @@ def load_geo_and_run_deseq2() -> tuple[pd.DataFrame, dict]:
         
     return combined_degs, expr_groups_dict
 
-# =============================================================================
-# Graph Format Preparation & TFs
-# =============================================================================
+##################################################
+# PHASE 6: TRANSCRIPTION FACTOR LIST UTILITIES   #
+##################################################
 
-def load_tf_list(path: str) -> set:
-    """Carga la lista de Factores de Transcripción conocidos."""
+def load_tf_list(path: str) -> set[str]:
+    """
+    Loads a reference list of known human transcription factor (TF) names.
+
+    Parses a local text file containing TF gene names (one name per line), 
+    converts them to uppercase, and returns them as a set for Prior Boosting.
+
+    Args:
+        path (str): File system path to the transcription factor text file.
+
+    Returns:
+        set[str]: A set of transcription factor gene names (str).
+    """
     try:
         if os.path.exists(path):
             with open(path, 'r') as f:
@@ -397,46 +504,61 @@ def load_tf_list(path: str) -> set:
         print(f"[WARN] Error leyendo TFs: {e}")
         return set()
 
-def build_correlation_baseline(expr: pd.DataFrame, tf_set: set) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Data]:
+##################################################
+# PHASE 7: BASELINE GRAPH & PYG DATA BUILDER     #
+##################################################
+
+def build_correlation_baseline(expr: pd.DataFrame, tf_set: set[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Data]:
     """
-    Construye las redes base (Pearson, Spearman y Ensemble).
-    Aplica Boosts de TFs.
-    Extrae un grafo de PyTorch Geometric apoyado sobre el Ensemble.
-    Retorna: (ensemble_bin, pearson_bin, spearman_bin, ensemble_corr_raw, pyg_data)
+    Constructs statistical co-expression baseline networks and prepares GNN features.
+
+    Calculates Pearson and Spearman correlation matrices across genes, applies 
+    WGCNA soft-thresholding (power beta=4) to amplify strong links, and promedies 
+    them to build an Ensemble correlation matrix. Promotes regulatory priors by 
+    multiplying correlation values involving transcription factors (TFs) by 1.5. 
+    Binarizes networks using the 95th percentile threshold. Finally, calculates 
+    Z-score normalized expression, node degrees, and eigenvector centralities to 
+    build and return a PyTorch Geometric Data object.
+
+    Args:
+        expr (pd.DataFrame): Expression matrix of shape (num_genes, num_samples).
+        tf_set (set[str]): Set of verified transcription factor gene names.
+
+    Returns:
+        tuple: A 7-element tuple containing:
+            - ensemble_bin (np.ndarray): Binarized ensemble adjacency matrix of shape (num_genes, num_genes).
+            - pearson_bin (np.ndarray): Binarized Pearson adjacency matrix.
+            - spearman_bin (np.ndarray): Binarized Spearman adjacency matrix.
+            - ensemble_corr (np.ndarray): Continuous boosted ensemble correlation matrix.
+            - corr_p_boost (np.ndarray): Continuous boosted Pearson correlation matrix.
+            - corr_s_boost (np.ndarray): Continuous boosted Spearman correlation matrix.
+            - pyg_data (Data): PyTorch Geometric graph data object containing node features, 
+              edge indices, and positive edge weights.
     """
-    # Pearson
     corr_p_vals = np.corrcoef(expr.values)
     corr_p_vals = np.nan_to_num(corr_p_vals, nan=0.0, posinf=0.0, neginf=0.0)
     np.fill_diagonal(corr_p_vals, 0.0)
     corr_p = np.abs(corr_p_vals)
     
-    # Spearman
     ranks = np.argsort(np.argsort(expr.values, axis=1), axis=1).astype(float)
     corr_s_vals = np.corrcoef(ranks)
     corr_s_vals = np.nan_to_num(corr_s_vals, nan=0.0, posinf=0.0, neginf=0.0)
     np.fill_diagonal(corr_s_vals, 0.0)
     corr_s = np.abs(corr_s_vals)
     
-    # WGCNA Soft-thresholding
     beta = getattr(CFG, 'WGCNA_POWER_BETA', 4)
     corr_p_powered = corr_p ** beta
     corr_s_powered = corr_s ** beta
     
-    # Ensemble (Baseline clásico adaptado con Soft-Thresholding)
     ensemble_corr = (corr_p_powered + corr_s_powered) / 2.0
     
-    # TF Boosting individual por matrices por si lo usamos después
     genes = expr.index.tolist()
     is_tf = np.array([g in tf_set for g in genes])
-    
-    # Si al menos un nodo en el par (i, j) es TF, aplicamos el boost
     tf_mask = is_tf[:, None] | is_tf[None, :] 
     
-    # Aplicar TF boost a Ensemble
     ensemble_corr[tf_mask] *= CFG.TF_BOOST_FACTOR
     ensemble_corr = np.clip(ensemble_corr, 0.0, 1.0)
     
-    # Aplicar a las correlaciones independientes
     corr_p_boost = corr_p.copy()
     corr_p_boost[tf_mask] *= CFG.TF_BOOST_FACTOR
     corr_p_boost = np.clip(corr_p_boost, 0.0, 1.0)
@@ -445,7 +567,6 @@ def build_correlation_baseline(expr: pd.DataFrame, tf_set: set) -> tuple[np.ndar
     corr_s_boost[tf_mask] *= CFG.TF_BOOST_FACTOR
     corr_s_boost = np.clip(corr_s_boost, 0.0, 1.0)
     
-    # Umbralizado al exacto mismo percentil para que TODAS las redes tengan la misma Sparsity inicial
     p_val_e = np.percentile(ensemble_corr.flatten(), CFG.CORR_THRESHOLD_PERCENTILE)
     ensemble_bin = (ensemble_corr >= p_val_e).astype(float)
     
@@ -455,18 +576,15 @@ def build_correlation_baseline(expr: pd.DataFrame, tf_set: set) -> tuple[np.ndar
     p_val_s = np.percentile(corr_s_boost.flatten(), CFG.CORR_THRESHOLD_PERCENTILE)
     spearman_bin = (corr_s_boost >= p_val_s).astype(float)
     
-    # PyG Graph logic basado en el ENSEMBLE
     edge_indices = np.where(ensemble_bin > 0)
     pos_edge_index = torch.tensor(np.array(edge_indices), dtype=torch.long)
     pos_edge_attr = torch.tensor(ensemble_corr[edge_indices], dtype=torch.float32).unsqueeze(1)
     
-    # Feature Normalization (Z-score por gen) para evitar colapsos
     features = expr.values
     features_mean = features.mean(axis=1, keepdims=True)
     features_std = features.std(axis=1, keepdims=True) + 1e-9
     norm_features = (features - features_mean) / features_std
     
-    # Extra Topological Features (Normalized Degree + Eigenvector Centrality)
     G_base = nx.from_numpy_array(ensemble_bin)
     degrees = np.array([d for n, d in G_base.degree()])
     if degrees.max() > 0:
@@ -486,57 +604,28 @@ def build_correlation_baseline(expr: pd.DataFrame, tf_set: set) -> tuple[np.ndar
     
     return ensemble_bin, pearson_bin, spearman_bin, ensemble_corr, corr_p_boost, corr_s_boost, pyg_data
 
-def download_and_parse_genemania_coexp() -> set:
-    """
-    Descarga Mapeos de IDs y redes de Co-expresión de GeneMANIA.
-    Mapea de Preferred_Name a Hugo Gene Symbol y retorna el GS de Co-expresión.
-    """
-    mappings_path = DATA_DIR / "genemania_identifier_mappings.txt"
-    if not mappings_path.exists():
-        print("[GeneMANIA] Descargando ID mappings (~11MB)...")
-        urllib.request.urlretrieve(CFG.GENEMANIA_ID_MAPPING_URL, mappings_path)
-    
-    print("[GeneMANIA] Parseando ID Mappings (Preferred_Name to Gene Name)...")
-    pm_to_gene = {}
-    with open(mappings_path, "r", encoding="utf-8") as f:
-        f.readline()
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 3:
-                pname, name, source = parts[0], parts[1], parts[2]
-                if source == "Gene Name":
-                    pm_to_gene[pname] = name.upper()
-    
-    unique_edges = set()
-    print("[GeneMANIA] Procesando redes de Co-expresión superiores...")
-    for url in CFG.GENEMANIA_COEXP_URLS:
-        filename = url.split("/")[-1]
-        local_path = DATA_DIR / filename
-        if not local_path.exists():
-            print(f"  -> Descargando {filename} ...")
-            urllib.request.urlretrieve(url, local_path)
-        
-        with open(local_path, "r", encoding="utf-8") as f:
-            f.readline()
-            for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) >= 2:
-                    g1 = pm_to_gene.get(parts[0])
-                    g2 = pm_to_gene.get(parts[1])
-                    if g1 and g2 and g1 != g2:
-                        if g1 < g2:
-                            unique_edges.add((g1, g2))
-                        else:
-                            unique_edges.add((g2, g1))
-                            
-    print(f"  -> GeneMANIA Co-expression Red Cargada: {len(unique_edges)} aristas únicas válidas.")
-    return unique_edges
+##################################################
+# PHASE 8: ALGORITHMIC BASELINES (ARACNE, WGCNA)#
+##################################################
 
-def build_aracne_baseline(expr: pd.DataFrame) -> np.ndarray:
+def build_aracne_baseline(expr: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """
-    Implementación de ARACNE (Mutual Information + DPI).
-    1. MI Gaussiana: MI = -0.5 * ln(1 - rho^2).
-    2. DPI (Data Processing Inequality) para eliminar arcos indirectos.
+    Infers a gene regulatory network using the ARACNE algorithm.
+
+    First calculates Gaussian Mutual Information (MI) from the absolute correlation 
+    coefficients as: MI = -0.5 * ln(1 - r^2). Then, applies the Data Processing 
+    Inequality (DPI) to prune indirect connections (the weakest link in any triangle 
+    is removed if it is weaker than the other two multiplied by a tolerance). 
+    Binarizes the resulting MI matrix selecting the top-K highest-scoring edges to 
+    match the target density.
+
+    Args:
+        expr (pd.DataFrame): Gene expression matrix of shape (num_genes, num_samples).
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: A tuple containing:
+            - aracne_bin (np.ndarray): Binary symmetric adjacency matrix of shape (num_genes, num_genes).
+            - out_mi (np.ndarray): Continuous pruned Mutual Information matrix of shape (num_genes, num_genes).
     """
     corr_matrix = np.abs(np.nan_to_num(np.corrcoef(expr.values), nan=0.0, posinf=0.0, neginf=0.0))
     np.fill_diagonal(corr_matrix, 0.0)
@@ -573,10 +662,22 @@ def build_aracne_baseline(expr: pd.DataFrame) -> np.ndarray:
     np.fill_diagonal(aracne_bin, 0.0)
     return aracne_bin, out_mi
 
-def build_wgcna_baseline(expr: pd.DataFrame) -> np.ndarray:
+def build_wgcna_baseline(expr: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """
-    Inferencia WGCNA (Soft-Thresholding).
-    Aplica una potencia (beta) a la correlación de Pearson.
+    Infers a co-expression network using the WGCNA soft-thresholding protocol.
+
+    Calculates the absolute Pearson correlation matrix and raises all coefficients 
+    to the soft-thresholding power beta (typically 4). This soft-thresholding 
+    reduces noise and strengthens strong correlations. Binarizes the resulting 
+    matrix by extracting the top-K highest-scoring edges to match the target density.
+
+    Args:
+        expr (pd.DataFrame): Gene expression matrix of shape (num_genes, num_samples).
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: A tuple containing:
+            - wgcna_bin (np.ndarray): Binary symmetric adjacency matrix of shape (num_genes, num_genes).
+            - wgcna_adj (np.ndarray): Continuous soft-thresholded correlation matrix.
     """
     corr_p = np.abs(np.nan_to_num(np.corrcoef(expr.values), nan=0.0, posinf=0.0, neginf=0.0))
     np.fill_diagonal(corr_p, 0.0)

@@ -3,16 +3,48 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 
+##################################################
+# PHASE 1: GATV2 ENCODER NETWORK ARCHITECTURE   #
+##################################################
+
 class TopologyAwareGATEncoder(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads=2):
+    """
+    Graph Attention Network (GATv2) encoder for gene expression and topology.
+
+    This encoder projects input node features and edge weights into a latent 
+    space, outputting the parameters (mean and log variance) of a variational 
+    distribution. It utilizes GATv2 layers to capture dynamic, cell-context-specific 
+    regulatory relationships.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int, heads: int = 2):
+        """
+        Initializes the TopologyAwareGATEncoder.
+
+        Args:
+            in_channels (int): Dimension of the input node features.
+            hidden_channels (int): Dimension of the hidden attention channels.
+            out_channels (int): Dimension of the output latent space.
+            heads (int, optional): Number of attention heads. Defaults to 2.
+        """
         super().__init__()
-        # GATv2 para atención dinámica (mucho mejor que GCN para redes densas)
         self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=heads, concat=True, edge_dim=1)
-        # Las cabezas se concatenan, así que la entrada a cond_mu es hidden_channels * heads
         self.conv_mu = GATv2Conv(hidden_channels * heads, out_channels, heads=1, concat=False, edge_dim=1)
         self.conv_logstd = GATv2Conv(hidden_channels * heads, out_channels, heads=1, concat=False, edge_dim=1)
 
-    def forward(self, x, edge_index, edge_attr=None):
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Executes the forward pass of the encoder.
+
+        Args:
+            x (torch.Tensor): Node feature matrix of shape (num_nodes, in_channels).
+            edge_index (torch.Tensor): Graph edge indices of shape (2, num_edges).
+            edge_attr (torch.Tensor, optional): Edge weights/attributes of shape (num_edges, 1). Defaults to None.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - mu (torch.Tensor): Mean vector of the latent distribution of shape (num_nodes, out_channels).
+                - logstd (torch.Tensor): Log standard deviation vector of shape (num_nodes, out_channels).
+        """
         if edge_attr is not None:
             x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
             return self.conv_mu(x, edge_index, edge_attr=edge_attr), self.conv_logstd(x, edge_index, edge_attr=edge_attr)
@@ -20,63 +52,113 @@ class TopologyAwareGATEncoder(nn.Module):
             x = self.conv1(x, edge_index).relu()
             return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 
+##################################################
+# PHASE 2: VARIATIONAL AUTOENCODER CONTAINER    #
+##################################################
+
 class TAGAT(nn.Module):
     """
-    Topology-Aware Graph Attention Autoencoder (TA-GAT)
+    Topology-Aware Graph Attention Autoencoder (TA-GAT) model.
+
+    This model integrates a GATv2 encoder within a variational autoencoder (VAE) 
+    framework to reconstruct gene regulatory networks from gene expression data 
+    and topological baselines.
     """
-    def __init__(self, encoder):
+    def __init__(self, encoder: nn.Module):
+        """
+        Initializes the TAGAT model.
+
+        Args:
+            encoder (nn.Module): The GATv2-based encoder module.
+        """
         super().__init__()
         self.encoder = encoder
 
-    def encode(self, *args, **kwargs):
-        # Retorna el embedding determinista z (mu) + reparametrización
+    def encode(self, *args, **kwargs) -> torch.Tensor:
+        """
+        Encodes input features and extracts the latent representation.
+
+        During training, this method applies the reparameterization trick using 
+        mu and clamped logstd. During evaluation, it returns the deterministic mu.
+
+        Args:
+            *args: Positional arguments passed to the encoder.
+            **kwargs: Keyword arguments passed to the encoder.
+
+        Returns:
+            torch.Tensor: Latent representation z of shape (num_nodes, out_channels).
+        """
         mu, logstd = self.encoder(*args, **kwargs)
         self.__mu__ = mu
-        # Clamping fuerte para evitar explosión de la divergencia KL en época 1
         self.__logstd__ = logstd.clamp(min=-10, max=2)
         z = self.reparametrize(self.__mu__, self.__logstd__)
         return z
 
-    def reparametrize(self, mu, logstd):
+    def reparametrize(self, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
+        """
+        Applies the reparameterization trick for variational inference.
+
+        Args:
+            mu (torch.Tensor): Mean vector of the latent distribution.
+            logstd (torch.Tensor): Log standard deviation of the latent distribution.
+
+        Returns:
+            torch.Tensor: Sampled latent representation z.
+        """
         if self.training:
             return mu + torch.randn_like(logstd) * torch.exp(logstd)
         else:
             return mu
 
-    def kl_loss(self, mu=None, logstd=None):
+    def kl_loss(self, mu: torch.Tensor = None, logstd: torch.Tensor = None) -> torch.Tensor:
+        """
+        Computes the Kullback-Leibler (KL) divergence loss.
+
+        This regularizes the latent space by minimizing the divergence between 
+        the predicted variational distribution and a standard normal prior.
+
+        Args:
+            mu (torch.Tensor, optional): Latent mean vector. Defaults to cached __mu__.
+            logstd (torch.Tensor, optional): Latent log standard deviation vector. Defaults to cached __logstd__.
+
+        Returns:
+            torch.Tensor: Scalar KL divergence loss.
+        """
         mu = self.__mu__ if mu is None else mu
         logstd = self.__logstd__ if logstd is None else logstd
-        # logstd <= 2 -> exp(2) = 7.3 -> exp(2)^2 = 54
         return -0.5 * torch.mean(
             torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1)
         )
 
-# --- Funciones de Pérdida (Loss) ---
+##################################################
+# PHASE 3: DIFFERENTIABLE TOPOLOGICAL LOSSES     #
+##################################################
 
 def scale_free_loss_v2(adj_pred: torch.Tensor, gamma: float = 2.5) -> torch.Tensor:
     """
-    Pérdida Topológica Scale-Free v2 (Diferenciable en log-log space).
-    
-    Estrategia: En una red scale-free, la relación log(grado) vs log(rango) es lineal
-    con pendiente negativa. Optimizamos directamente el R² de esta regresión lineal
-    en espacio logarítmico, más un término de heterogeneidad de grado.
-    
-    Componentes:
-    1. Linearity Loss: (1 - R²) en espacio log-log → fuerza ajuste power-law
-    2. Slope Penalty: penaliza pendiente positiva (debe ser negativa)
-    3. Heterogeneity: coeficiente de variación del grado → fomenta hubs
+    Computes the differentiable scale-free topology loss.
+
+    This loss forces the predicted network to exhibit a power-law degree distribution, 
+    which is characteristic of real biological networks. It performs a differentiable 
+    linear regression in log-log space (log degree vs log rank), minimizing the 
+    residual variance (1 - R^2), penalizing positive slopes, and maximizing 
+    degree heterogeneity using the coefficient of variation.
+
+    Args:
+        adj_pred (torch.Tensor): Predicted soft adjacency matrix of shape (num_nodes, num_nodes).
+        gamma (float, optional): Power-law exponent target parameter. Defaults to 2.5.
+
+    Returns:
+        torch.Tensor: Scalar scale-free regularization loss.
     """
-    # Grado suave (soft degree) de cada nodo
     degrees = torch.sum(adj_pred, dim=1)
     degrees = torch.clamp(degrees, min=0.1)
     
-    # Ordenar descendente (hubs primero)
     sorted_deg, _ = torch.sort(degrees, descending=True)
     
     N = adj_pred.size(0)
     ranks = torch.arange(1, N + 1, device=adj_pred.device, dtype=torch.float32)
     
-    # --- Regresión lineal diferenciable en log-log ---
     log_ranks = torch.log(ranks)
     log_degrees = torch.log(sorted_deg + 1e-6)
     
@@ -90,63 +172,71 @@ def scale_free_loss_v2(adj_pred: torch.Tensor, gamma: float = 2.5) -> torch.Tens
     ss_xx = (dx ** 2).sum()
     ss_yy = (dy ** 2).sum()
     
-    # R² diferenciable
     r_squared = (ss_xy ** 2) / (ss_xx * ss_yy + 1e-9)
     linearity_loss = 1.0 - r_squared
     
-    # Pendiente: debe ser negativa (grado decrece con rango)
     slope = ss_xy / (ss_xx + 1e-9)
-    slope_penalty = F.relu(slope + 0.3)  # Penalizar si slope > -0.3
+    slope_penalty = F.relu(slope + 0.3)
     
-    # Heterogeneidad: coeficiente de variación alto = red con hubs
-    # CV bajo → red uniforme/aleatoria → penalizar
     degree_cv = degrees.std() / (degrees.mean() + 1e-9)
     uniformity_penalty = 1.0 / (degree_cv + 0.1)
     
     return linearity_loss + 0.5 * slope_penalty + 0.05 * uniformity_penalty
 
-
 def targeted_sparsity_loss(adj_pred: torch.Tensor) -> torch.Tensor:
     """
-    Sparsity dirigida compatible con scale-free (normalizada por N).
-    
-    En lugar de penalizar la media global de adj (que aplana hubs), penalizamos:
-    1. El grado mínimo → fuerza que existan nodos hoja (grado bajo)
-    2. La mediana del grado → controla la densidad sin destruir hubs
-    
-    Normalizado por N para que la escala sea comparable a las otras losses (~0-1).
+    Computes the targeted sparsity loss.
+
+    This loss penalizes high minimum and median node degrees in the predicted network, 
+    enforcing a sparse periphery and allowing a few central hub genes to remain highly 
+    connected. It controls overall network density without destroying biological hubs.
+
+    Args:
+        adj_pred (torch.Tensor): Predicted soft adjacency matrix of shape (num_nodes, num_nodes).
+
+    Returns:
+        torch.Tensor: Scalar targeted sparsity loss.
     """
     degrees = torch.sum(adj_pred, dim=1)
     N = adj_pred.size(0)
     
-    # Normalizar por N para escala comparable
     norm_degrees = degrees / N
     
-    # Penalizar grado mínimo alto (queremos nodos hoja)
     min_degree_penalty = torch.min(norm_degrees)
     
-    # Penalizar mediana de grado alta (controla densidad general)
     sorted_deg, _ = torch.sort(norm_degrees)
     median_idx = len(sorted_deg) // 2
     median_degree_penalty = sorted_deg[median_idx]
     
     return 0.5 * min_degree_penalty + 0.5 * median_degree_penalty
 
-
 def ta_gat_loss(z: torch.Tensor, 
                 pos_edge_index: torch.Tensor, 
                 neg_edge_index: torch.Tensor, 
                 lambda_sf: float = 5.0,
-                pos_edge_weights: torch.Tensor = None) -> tuple:
+                pos_edge_weights: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Pérdida combinada de TA-GAT v2:
-    1. Reconstrucción BCE Ponderada (Edges iniciales dictados por correlación)
-    2. Scale-Free Loss v2 (R² en log-log + heterogeneidad de grado)
-    3. Targeted Sparsity (mediana + mínimo de grado, compatible con hubs)
+    Computes the combined loss terms for the TA-GAT training step.
+
+    Integrates standard binary cross-entropy reconstruction loss over positive 
+    and negative sampled edges, scale-free topological regularization, and 
+    targeted sparsity loss.
+
+    Args:
+        z (torch.Tensor): Latent node representations of shape (num_nodes, out_channels).
+        pos_edge_index (torch.Tensor): Positive edge indices of shape (2, num_pos_edges).
+        neg_edge_index (torch.Tensor): Sampled negative edge indices of shape (2, num_neg_edges).
+        lambda_sf (float, optional): Weight of the scale-free regularization loss. Defaults to 5.0.
+        pos_edge_weights (torch.Tensor, optional): Edge weights for positive edges. Defaults to None.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
+            - recon_loss (torch.Tensor): Scalar edge reconstruction loss (BCE).
+            - sf_loss (torch.Tensor): Scalar scale-free topological regularization loss.
+            - sparsity_loss (torch.Tensor): Scalar targeted network sparsity loss.
     """
     EPS = 1e-15
     
-    # --- 1. Reconstrucción (BCE Básica Vectorizada) ---
     pos_pred = torch.sigmoid(torch.sum(z[pos_edge_index[0]] * z[pos_edge_index[1]], dim=1))
     neg_pred = torch.sigmoid(torch.sum(z[neg_edge_index[0]] * z[neg_edge_index[1]], dim=1))
     
@@ -154,7 +244,6 @@ def ta_gat_loss(z: torch.Tensor,
     neg_loss = -torch.log(1 - neg_pred + EPS).mean()
     recon_loss = pos_loss + neg_loss
     
-    # --- 2. Scale-Free Regularization v2 ---
     z_norm = F.normalize(z, p=2, dim=1)
     adj_pred_dense = torch.sigmoid(torch.matmul(z_norm, z_norm.t()))
     mask = ~torch.eye(adj_pred_dense.size(0), dtype=torch.bool, device=adj_pred_dense.device)
