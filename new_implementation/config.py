@@ -49,7 +49,16 @@ class Config:
         EVAL_EDGE_THRESHOLD (float): Threshold percentile score used during metric evaluations.
     """
     SEED = 123
-    
+
+    # ── Modo local (CSV pre-procesados) ──────────────────────────────────────
+    # Si LOCAL_MODE=True, se omite la descarga de GEO y se cargan directamente
+    # los ficheros counts_control_CLEAN.csv y counts_primary_CLEAN.csv desde
+    # LOCAL_DATASET_PATH (directorio del dataset elegido).
+    LOCAL_MODE: bool = False
+    LOCAL_DATASET_PATH = None   # Path al directorio del dataset seleccionado
+    DATASET_NAME: str = ""      # Nombre legible del dataset (p.ej. 'TCGA-BRCA-Basal')
+    # ─────────────────────────────────────────────────────────────────────────
+
     GEO_ID = None
     GEO_METADATA_KEY = None
     GEO_GROUPS = {}       

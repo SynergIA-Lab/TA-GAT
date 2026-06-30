@@ -695,3 +695,153 @@ def build_wgcna_baseline(expr: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     wgcna_bin = (wgcna_adj >= thresh).astype(float)
     np.fill_diagonal(wgcna_bin, 0.0)
     return wgcna_bin, wgcna_adj
+
+##################################################
+# PHASE 9: LOCAL CSV LOADING & DESEQ2           #
+##################################################
+
+def load_local_counts_and_run_deseq2() -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """
+    Loads pre-cleaned count matrices from local CSV files and runs PyDESeq2 to identify DEGs.
+
+    Expects two files in CFG.LOCAL_DATASET_PATH:
+        - counts_control_CLEAN.csv  (genes × control samples, integer raw counts)
+        - counts_primary_CLEAN.csv  (genes × tumor/primary samples, integer raw counts)
+
+    Merges them into a single counts matrix, assigns cohort labels ('Normal' for
+    control samples, 'Tumor' for primary samples), then runs PyDESeq2 with the same
+    filtering, DEG extraction, and 1500-gene cap used in load_geo_and_run_deseq2().
+
+    Returns:
+        tuple[pd.DataFrame, dict[str, pd.DataFrame]]: A tuple containing:
+            - combined_degs (pd.DataFrame): Statistics table for the unified DEGs.
+            - expr_groups_dict (dict[str, pd.DataFrame]): Dictionary mapping cohort
+              names to their respective expression matrices of shape
+              (num_degs, num_cohort_samples).
+    """
+    from config import CFG
+
+    dataset_dir = CFG.LOCAL_DATASET_PATH
+    if dataset_dir is None:
+        raise ValueError("[ERROR] CFG.LOCAL_DATASET_PATH no está configurado.")
+
+    dataset_dir = Path(dataset_dir)
+    ctrl_path = dataset_dir / "counts_control_CLEAN.csv"
+    prim_path = dataset_dir / "counts_primary_CLEAN.csv"
+
+    if not ctrl_path.exists():
+        raise FileNotFoundError(f"[ERROR] No encontrado: {ctrl_path}")
+    if not prim_path.exists():
+        raise FileNotFoundError(f"[ERROR] No encontrado: {prim_path}")
+
+    print(f"\n[LOCAL] Cargando matrices de cuentas desde: {dataset_dir.name}")
+    df_ctrl = pd.read_csv(ctrl_path, index_col=0)
+    df_prim = pd.read_csv(prim_path, index_col=0)
+
+    print(f"  -> Control:  {df_ctrl.shape[0]} genes × {df_ctrl.shape[1]} muestras")
+    print(f"  -> Primary:  {df_prim.shape[0]} genes × {df_prim.shape[1]} muestras")
+
+    # Unificar índice de genes (intersección para garantizar la alineación)
+    common_genes = df_ctrl.index.intersection(df_prim.index)
+    if len(common_genes) == 0:
+        raise ValueError("[ERROR] No hay genes en común entre control y primary. Verifica los ficheros.")
+    df_ctrl = df_ctrl.loc[common_genes]
+    df_prim = df_prim.loc[common_genes]
+
+    # Combinar en una sola matriz genes × muestras
+    expr_df = pd.concat([df_ctrl, df_prim], axis=1)
+
+    # Construir metadatos de muestra
+    ctrl_labels = pd.DataFrame(
+        {"label": "Normal"},
+        index=df_ctrl.columns
+    )
+    prim_labels = pd.DataFrame(
+        {"label": "Tumor"},
+        index=df_prim.columns
+    )
+    meta_df = pd.concat([ctrl_labels, prim_labels])
+    meta_df.index.name = "sample"
+
+    # Alinear muestras
+    common_samples = meta_df.index.intersection(expr_df.columns)
+    expr_df = expr_df[common_samples]
+    meta_df = meta_df.loc[common_samples]
+
+    print(f"  -> Matriz combinada: {expr_df.shape[0]} genes × {expr_df.shape[1]} muestras")
+
+    # ── PyDESeq2 ────────────────────────────────────────────────────────────
+    print("\n[PyDESeq2] Ejecutando Differential Expression Analysis...")
+    counts_clean = expr_df.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    if (counts_clean < 0).any().any():
+        print("  -> Autodetectados valores negativos. Revirtiendo a cuentas raw (2^x)...")
+        counts_clean = 2 ** counts_clean
+
+    counts_clean = np.maximum(0, counts_clean).round().astype(int)
+    counts_clean = counts_clean.loc[counts_clean.sum(axis=1) >= CFG.MIN_TOTAL_COUNTS_PER_GENE, :]
+
+    counts_sxg = counts_clean.T
+    inference = DefaultInference(n_cpus=CFG.N_CPUS)
+    dds = DeseqDataSet(
+        counts=counts_sxg,
+        metadata=meta_df,
+        design=f"~ {CFG.CONDITION_COL}",
+        refit_cooks=True,
+        inference=inference,
+    )
+    dds.deseq2()
+
+    print("  -> Contrastando Tumor vs Normal...")
+    all_sig_degs = []
+    try:
+        stat_res = DeseqStats(
+            dds,
+            contrast=(CFG.CONDITION_COL, "Tumor", "Normal"),
+            inference=inference,
+            alpha=CFG.ALPHA,
+        )
+        stat_res.summary()
+        results_df = stat_res.results_df.copy()
+
+        sig_mask = results_df["padj"].notna() & (results_df["padj"] <= CFG.ALPHA)
+        sig_degs = results_df[sig_mask]
+        sig_degs = sig_degs[sig_degs["log2FoldChange"].abs() >= CFG.LOG2FC_THRESH]
+        all_sig_degs.append(sig_degs)
+    except Exception as e:
+        print(f"[ERROR] Falló el contraste Tumor vs Normal: {e}")
+
+    valid_degs = [df for df in all_sig_degs if len(df) > 0]
+    if valid_degs:
+        combined_degs = pd.concat(valid_degs)
+        combined_degs = combined_degs[~combined_degs.index.duplicated(keep="first")]
+    else:
+        print("[WARN] No se extrajeron DEGs. Usando los 500 genes más variables.")
+        variances = counts_clean.var(axis=1).sort_values(ascending=False).head(500)
+        combined_degs = pd.DataFrame(index=variances.index)
+
+    if len(combined_degs) > 1500:
+        if "padj" in combined_degs.columns:
+            combined_degs = combined_degs.sort_values("padj").head(1500)
+        else:
+            combined_degs = combined_degs.head(1500)
+    elif len(combined_degs) < 50:
+        print("[WARN] Muy pocos DEGs detectados.")
+
+    deg_names = combined_degs.index.tolist()
+
+    # Matrices de expresión por grupo (usando expr_df original, no counts_clean)
+    expr_groups_dict = {
+        "Normal": expr_df.loc[deg_names, meta_df[meta_df[CFG.CONDITION_COL] == "Normal"].index],
+        "Tumor":  expr_df.loc[deg_names, meta_df[meta_df[CFG.CONDITION_COL] == "Tumor"].index],
+    }
+
+    print(f"  -> DEGs finales: {len(deg_names)}")
+    for g_name, mat in expr_groups_dict.items():
+        print(f"  -> Matriz '{g_name}': {mat.shape}")
+
+    # Configurar grupos en CFG para que el resto del pipeline los lea
+    CFG.GEO_GROUPS = {"Normal": ["Normal"], "Tumor": ["Tumor"]}
+    CFG.GEO_CONTROL_GROUP = "Normal"
+
+    return combined_degs, expr_groups_dict

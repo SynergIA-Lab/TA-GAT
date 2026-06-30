@@ -447,7 +447,13 @@ def main():
     tf_set = load_tf_list(CFG.TF_LIST_PATH)
     print(f"  -> TFs Cargados: {len(tf_set)}")
 
-    sig_degs, expr_groups_dict = load_geo_and_run_deseq2()
+    if CFG.LOCAL_MODE:
+        from data_loader import load_local_counts_and_run_deseq2
+        sig_degs, expr_groups_dict = load_local_counts_and_run_deseq2()
+        dataset_id = CFG.DATASET_NAME
+    else:
+        sig_degs, expr_groups_dict = load_geo_and_run_deseq2()
+        dataset_id = CFG.GEO_ID
     degs_genes = sig_degs.index.tolist()
     
     from data_loader import download_and_parse_biogrid, download_and_parse_string, download_and_parse_genemania_coexp, create_ground_truth_adj
@@ -467,7 +473,7 @@ def main():
             print(f"[WARN] El grupo '{g_name}' no tiene suficientes muestras. Saltando pipeline.")
             continue
             
-        g_res, g_adj = run_condition_pipeline(g_name, CFG.GEO_ID, g_expr, bg_adj, bg_eval_set, string_adj, string_eval_set, gm_adj, gm_eval_set, degs_genes, tf_set, device)
+        g_res, g_adj = run_condition_pipeline(g_name, dataset_id, g_expr, bg_adj, bg_eval_set, string_adj, string_eval_set, gm_adj, gm_eval_set, degs_genes, tf_set, device)
         all_final_results[g_name] = g_res
         adj_dict[g_name] = g_adj
 
