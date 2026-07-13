@@ -13,10 +13,14 @@ class TopologyAwareGATEncoder(nn.Module):
 
     This encoder projects input node features and edge weights into a latent 
     space, outputting the parameters (mean and log variance) of a variational 
-    distribution. It utilizes GATv2 layers to capture dynamic, cell-context-specific 
-    regulatory relationships.
+    distribution. It utilizes two stacked GATv2 layers to capture relationships 
+    up to 2 hops in the input graph, enabling the model to integrate information 
+    from second-order co-expression neighbours.
+
+    FIX (receptive field): A second GATv2 hidden layer was added so that each gene
+    aggregates information from its 2-hop neighbourhood instead of only 1 hop.
     """
-    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int, heads: int = 2):
+    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int, heads: int = 2, dropout: float = 0.0):
         """
         Initializes the TopologyAwareGATEncoder.
 
@@ -25,10 +29,16 @@ class TopologyAwareGATEncoder(nn.Module):
             hidden_channels (int): Dimension of the hidden attention channels.
             out_channels (int): Dimension of the output latent space.
             heads (int, optional): Number of attention heads. Defaults to 2.
+            dropout (float, optional): Dropout rate on attention coefficients for regularization.
+                A value of 0.2 is recommended for small DEG-sized datasets. Defaults to 0.0.
         """
         super().__init__()
-        self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=heads, concat=True, edge_dim=1)
-        self.conv_mu = GATv2Conv(hidden_channels * heads, out_channels, heads=1, concat=False, edge_dim=1)
+        # Layer 1: 1st hop aggregation
+        self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=heads, concat=True, edge_dim=1, dropout=dropout)
+        # Layer 2 (FIX): 2nd hop aggregation — was missing, limiting receptive field to 1 hop
+        self.conv2 = GATv2Conv(hidden_channels * heads, hidden_channels, heads=heads, concat=True, edge_dim=1, dropout=dropout)
+        # Variational output heads (no dropout — deterministic latent parameters)
+        self.conv_mu     = GATv2Conv(hidden_channels * heads, out_channels, heads=1, concat=False, edge_dim=1)
         self.conv_logstd = GATv2Conv(hidden_channels * heads, out_channels, heads=1, concat=False, edge_dim=1)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -47,9 +57,14 @@ class TopologyAwareGATEncoder(nn.Module):
         """
         if edge_attr is not None:
             x = self.conv1(x, edge_index, edge_attr=edge_attr).relu()
-            return self.conv_mu(x, edge_index, edge_attr=edge_attr), self.conv_logstd(x, edge_index, edge_attr=edge_attr)
+            x = self.conv2(x, edge_index, edge_attr=edge_attr).relu()   # FIX: 2nd hop
+            return (
+                self.conv_mu(x, edge_index, edge_attr=edge_attr),
+                self.conv_logstd(x, edge_index, edge_attr=edge_attr)
+            )
         else:
             x = self.conv1(x, edge_index).relu()
+            x = self.conv2(x, edge_index).relu()                        # FIX: 2nd hop
             return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 
 ##################################################
@@ -134,93 +149,102 @@ class TAGAT(nn.Module):
 # PHASE 3: DIFFERENTIABLE TOPOLOGICAL LOSSES     #
 ##################################################
 
-def scale_free_loss_v2(adj_pred: torch.Tensor, gamma: float = 2.5) -> torch.Tensor:
+def scale_free_loss_v2(degrees: torch.Tensor, gamma: float = 2.5) -> torch.Tensor:
     """
-    Computes the differentiable scale-free topology loss.
+    Computes the differentiable scale-free topology loss from a precomputed degree tensor.
 
-    This loss forces the predicted network to exhibit a power-law degree distribution, 
-    which is characteristic of real biological networks. It performs a differentiable 
-    linear regression in log-log space (log degree vs log rank), minimizing the 
-    residual variance (1 - R^2), penalizing positive slopes, and maximizing 
-    degree heterogeneity using the coefficient of variation.
+    FIX (O(N²) → O(E)): Previously, this function constructed the full NxN soft adjacency 
+    matrix inside the loss (O(N²) computation). It now operates directly on a soft degree 
+    tensor computed sparsely from the positive edge set in ta_gat_loss.
+
+    Forces the predicted degree distribution to follow a power law (characteristic of real 
+    biological networks). Performs differentiable linear regression in log-log space, 
+    minimising residual variance (1 - R²), penalising positive slopes, and maximising 
+    degree heterogeneity via coefficient of variation.
 
     Args:
-        adj_pred (torch.Tensor): Predicted soft adjacency matrix of shape (num_nodes, num_nodes).
+        degrees (torch.Tensor): Soft degree vector of shape (num_nodes,) — sum of predicted
+            edge probabilities per node, accumulated from the training edge set.
         gamma (float, optional): Power-law exponent target parameter. Defaults to 2.5.
 
     Returns:
         torch.Tensor: Scalar scale-free regularization loss.
     """
-    degrees = torch.sum(adj_pred, dim=1)
     degrees = torch.clamp(degrees, min=0.1)
-    
+
     sorted_deg, _ = torch.sort(degrees, descending=True)
-    
-    N = adj_pred.size(0)
-    ranks = torch.arange(1, N + 1, device=adj_pred.device, dtype=torch.float32)
-    
-    log_ranks = torch.log(ranks)
+
+    N = degrees.size(0)
+    ranks = torch.arange(1, N + 1, device=degrees.device, dtype=torch.float32)
+
+    log_ranks   = torch.log(ranks)
     log_degrees = torch.log(sorted_deg + 1e-6)
-    
+
     mean_x = log_ranks.mean()
     mean_y = log_degrees.mean()
-    
-    dx = log_ranks - mean_x
+
+    dx = log_ranks   - mean_x
     dy = log_degrees - mean_y
-    
+
     ss_xy = (dx * dy).sum()
     ss_xx = (dx ** 2).sum()
     ss_yy = (dy ** 2).sum()
-    
-    r_squared = (ss_xy ** 2) / (ss_xx * ss_yy + 1e-9)
+
+    r_squared      = (ss_xy ** 2) / (ss_xx * ss_yy + 1e-9)
     linearity_loss = 1.0 - r_squared
-    
-    slope = ss_xy / (ss_xx + 1e-9)
+
+    slope         = ss_xy / (ss_xx + 1e-9)
     slope_penalty = F.relu(slope + 0.3)
-    
-    degree_cv = degrees.std() / (degrees.mean() + 1e-9)
+
+    degree_cv          = degrees.std() / (degrees.mean() + 1e-9)
     uniformity_penalty = 1.0 / (degree_cv + 0.1)
-    
+
     return linearity_loss + 0.5 * slope_penalty + 0.05 * uniformity_penalty
 
-def targeted_sparsity_loss(adj_pred: torch.Tensor) -> torch.Tensor:
-    """
-    Computes the targeted sparsity loss.
 
-    This loss penalizes high minimum and median node degrees in the predicted network, 
-    enforcing a sparse periphery and allowing a few central hub genes to remain highly 
-    connected. It controls overall network density without destroying biological hubs.
+def targeted_sparsity_loss(degrees: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the targeted sparsity loss from a precomputed degree tensor.
+
+    FIX (O(N²) → O(E)): Previously operated on a full NxN adjacency matrix.
+    Now accepts the same sparse degree tensor computed in ta_gat_loss.
+
+    Penalises high minimum and median node degrees, enforcing a sparse periphery 
+    while allowing a few hub genes to remain highly connected.
 
     Args:
-        adj_pred (torch.Tensor): Predicted soft adjacency matrix of shape (num_nodes, num_nodes).
+        degrees (torch.Tensor): Soft degree vector of shape (num_nodes,).
 
     Returns:
         torch.Tensor: Scalar targeted sparsity loss.
     """
-    degrees = torch.sum(adj_pred, dim=1)
-    N = adj_pred.size(0)
-    
+    N = degrees.size(0)
     norm_degrees = degrees / N
-    
+
     min_degree_penalty = torch.min(norm_degrees)
-    
+
     sorted_deg, _ = torch.sort(norm_degrees)
-    median_idx = len(sorted_deg) // 2
+    median_idx         = len(sorted_deg) // 2
     median_degree_penalty = sorted_deg[median_idx]
-    
+
     return 0.5 * min_degree_penalty + 0.5 * median_degree_penalty
 
-def ta_gat_loss(z: torch.Tensor, 
-                pos_edge_index: torch.Tensor, 
-                neg_edge_index: torch.Tensor, 
+
+def ta_gat_loss(z: torch.Tensor,
+                pos_edge_index: torch.Tensor,
+                neg_edge_index: torch.Tensor,
                 lambda_sf: float = 5.0,
                 pos_edge_weights: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes the combined loss terms for the TA-GAT training step.
 
-    Integrates standard binary cross-entropy reconstruction loss over positive 
-    and negative sampled edges, scale-free topological regularization, and 
-    targeted sparsity loss.
+    FIX (train/infer mismatch): Latent embeddings are L2-normalised before computing
+    edge dot products, so that the cosine-similarity metric used during inference and 
+    the BCE loss used during training are now consistent.
+
+    FIX (O(N²) → O(E)): Scale-free and sparsity losses are computed from sparse 
+    soft-degree vectors accumulated over the training edge set, not from a dense NxN 
+    sigmoid matrix.
 
     Args:
         z (torch.Tensor): Latent node representations of shape (num_nodes, out_channels).
@@ -236,20 +260,25 @@ def ta_gat_loss(z: torch.Tensor,
             - sparsity_loss (torch.Tensor): Scalar targeted network sparsity loss.
     """
     EPS = 1e-15
-    
-    pos_pred = torch.sigmoid(torch.sum(z[pos_edge_index[0]] * z[pos_edge_index[1]], dim=1))
-    neg_pred = torch.sigmoid(torch.sum(z[neg_edge_index[0]] * z[neg_edge_index[1]], dim=1))
-    
-    pos_loss = -torch.log(pos_pred + EPS).mean()
-    neg_loss = -torch.log(1 - neg_pred + EPS).mean()
-    recon_loss = pos_loss + neg_loss
-    
+
+    # FIX: L2-normalise z so that training metric matches inference (cosine similarity)
     z_norm = F.normalize(z, p=2, dim=1)
-    adj_pred_dense = torch.sigmoid(torch.matmul(z_norm, z_norm.t()))
-    mask = ~torch.eye(adj_pred_dense.size(0), dtype=torch.bool, device=adj_pred_dense.device)
-    adj_pred_dense = adj_pred_dense * mask
-    
-    sf_loss = scale_free_loss_v2(adj_pred_dense)
-    sparsity_loss = targeted_sparsity_loss(adj_pred_dense)
-    
+
+    pos_pred = torch.sigmoid(torch.sum(z_norm[pos_edge_index[0]] * z_norm[pos_edge_index[1]], dim=1))
+    neg_pred = torch.sigmoid(torch.sum(z_norm[neg_edge_index[0]] * z_norm[neg_edge_index[1]], dim=1))
+
+    pos_loss   = -torch.log(pos_pred + EPS).mean()
+    neg_loss   = -torch.log(1 - neg_pred + EPS).mean()
+    recon_loss = pos_loss + neg_loss
+
+    # FIX: Sparse soft-degree accumulation — O(E) instead of O(N²)
+    # Accumulate predicted positive-edge probabilities per node
+    N = z.size(0)
+    soft_degrees = torch.zeros(N, device=z.device)
+    soft_degrees.scatter_add_(0, pos_edge_index[0], pos_pred)
+    soft_degrees.scatter_add_(0, pos_edge_index[1], pos_pred)
+
+    sf_loss       = scale_free_loss_v2(soft_degrees)
+    sparsity_loss = targeted_sparsity_loss(soft_degrees)
+
     return recon_loss, sf_loss, sparsity_loss

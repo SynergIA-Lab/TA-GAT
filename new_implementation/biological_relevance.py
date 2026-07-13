@@ -62,3 +62,71 @@ def analyze_hubs(adj_dict: dict, genes: list, tf_set: set, output_dir: Path) -> 
     print(f"\n[ÉXITO] Archivo 'hubs_comparison.csv' generado en {output_dir}")
     
     return df_summary
+
+
+##################################################
+# PHASE 2: DIFFERENTIAL NETWORK ANALYSIS        #
+##################################################
+
+def compute_differential_network(
+    adj_dict: dict,
+    genes: list,
+    output_dir: Path
+) -> pd.DataFrame | None:
+    """
+    Computes the differential (rewired) gene interaction network between two conditions.
+
+    For each pair of conditions (e.g., Tumor vs Normal), identifies:
+    - Edges gained exclusively in condition A (not present in B).
+    - Edges lost in condition A (present in B but not A).
+    - Net differential degree per gene: number of connections gained minus lost.
+
+    Genes with high absolute net differential degree are the most rewired regulators
+    in the biological transition, making them prime experimental candidates.
+
+    Args:
+        adj_dict (dict): Mapping condition name → binary adjacency matrix (num_genes, num_genes).
+        genes (list): Gene names corresponding to matrix indices.
+        output_dir (Path): Directory where CSV reports and differential degree rankings are saved.
+
+    Returns:
+        pd.DataFrame | None: DataFrame with one row per gene sorted by |net differential|,
+            or None if fewer than two conditions are available.
+    """
+    if len(adj_dict) < 2:
+        print("[Red Diferencial] Se necesitan al menos 2 condiciones. Saltando análisis.")
+        return None
+
+    cond_names = list(adj_dict.keys())
+    cond_a, cond_b = cond_names[0], cond_names[1]
+    adj_a = adj_dict[cond_a].astype(float)
+    adj_b = adj_dict[cond_b].astype(float)
+
+    # Edges present in A but not B (gained), and in B but not A (lost)
+    gained_in_a = np.clip(adj_a - adj_b, 0, 1)  # exclusive to condition A
+    lost_in_a   = np.clip(adj_b - adj_a, 0, 1)  # exclusive to condition B
+
+    gained_degree = gained_in_a.sum(axis=1)
+    lost_degree   = lost_in_a.sum(axis=1)
+    net_diff      = gained_degree - lost_degree  # + → more connections in A; − → fewer
+
+    df = pd.DataFrame({
+        "Gene":            genes,
+        f"Degree_{cond_a}": adj_a.sum(axis=1).astype(int),
+        f"Degree_{cond_b}": adj_b.sum(axis=1).astype(int),
+        "Gained_in_A":     gained_degree.astype(int),
+        "Lost_in_A":       lost_degree.astype(int),
+        "Net_Differential": net_diff.astype(int)
+    }).sort_values("Net_Differential", key=abs, ascending=False)
+
+    out_file = output_dir / f"differential_network_{cond_a}_vs_{cond_b}.csv"
+    df.to_csv(out_file, index=False)
+
+    print(f"\n[Red Diferencial] {cond_a} vs {cond_b}")
+    print(f"  → Aristas exclusivas de {cond_a}: {int(gained_in_a.sum() / 2)}")
+    print(f"  → Aristas exclusivas de {cond_b}: {int(lost_in_a.sum() / 2)}")
+    print(f"  → Top 20 genes con mayor rewiring diferencial:")
+    print(df.head(20)[["Gene", f"Degree_{cond_a}", f"Degree_{cond_b}", "Net_Differential"]].to_string(index=False))
+    print(f"  → Guardado en: {out_file}")
+
+    return df
