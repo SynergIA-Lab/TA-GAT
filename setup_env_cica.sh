@@ -1,57 +1,81 @@
 #!/bin/bash
 #############################################################
-#  setup_env_cica.sh
-#  Crea el entorno conda 'tagat_env' en el CICA.
-#  Ejecutar UNA SOLA VEZ desde un nodo de login (no de cómputo):
+#  setup_env_cica.sh  —  Crea el entorno de ejecución
 #
-#    chmod +x setup_env_cica.sh
-#    bash setup_env_cica.sh
+#  Configurado para el módulo Python verificado de Hércules (CICA).
+#  Ejecutar en el nodo de login:  bash setup_env_cica.sh
 #############################################################
 
-set -e   # salir si cualquier comando falla
+set -e
 
-TAGAT_ROOT="$HOME/TA-GAT"
-ENV_NAME="tagat_env"
+TAGAT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_DIR="$HOME/tagat_env_venv"
 
 echo "============================================================"
-echo "  Creando entorno conda: $ENV_NAME"
-echo "  TAGAT_ROOT: $TAGAT_ROOT"
+echo "  TA-GAT — Configuración del entorno (CICA)"
+echo "  TAGAT_ROOT : $TAGAT_ROOT"
+echo "  VENV_DIR   : $ENV_DIR"
 echo "============================================================"
+echo ""
 
-# ── Cargar conda ──────────────────────────────────────────────
-module load Anaconda3/2023.09-0   # ajusta al módulo disponible en el CICA
-source "$(conda info --base)/etc/profile.d/conda.sh"
+# 1. Cargar el módulo Python verificado del CICA
+echo "[1/4] Cargando módulo Python/3.11.5-GCCcore-13.2.0..."
+module load Python/3.11.5-GCCcore-13.2.0
 
-# ── Crear entorno con Python 3.11 ────────────────────────────
-conda create -y -n "$ENV_NAME" python=3.11
-conda activate "$ENV_NAME"
+echo "  Usando: $(python3 --version) de $(which python3)"
+echo ""
 
-# ── Instalar PyTorch con CUDA 12.1 ───────────────────────────
-# Consultar https://pytorch.org/get-started/locally/ si cambia la versión CUDA
+# 2. Crear entorno virtual estándar en tu HOME
+echo "[2/4] Creando Entorno Virtual (venv) en: $ENV_DIR..."
+if [ -d "$ENV_DIR" ]; then
+    echo "  ⚠️ El entorno venv ya existe. Reutilizando..."
+else
+    python3 -m venv "$ENV_DIR"
+    echo "  ✅ Entorno virtual creado."
+fi
+
+# Activar el entorno virtual
+source "$ENV_DIR/bin/activate"
+echo "  ✅ Entorno virtual activado."
+echo ""
+
+# 3. Actualizar pip e instalar PyTorch + PyG con soporte CUDA
+echo "[3/4] Instalando PyTorch + PyG (CUDA 12.1 compatible)..."
+pip install --upgrade pip
+
+# PyTorch 2.3.1 con CUDA 12.1
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 
-# ── Instalar PyTorch Geometric y extensiones ─────────────────
+# PyG y extensiones sparse compatibles con torch 2.3.1 + cu121
 pip install torch-geometric==2.5.3
-pip install pyg-lib torch-scatter torch-sparse \
-    -f https://data.pyg.org/whl/torch-2.3.1+cu121.html
+pip install pyg-lib torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.3.1+cu121.html
 
-# ── Instalar el resto de dependencias ────────────────────────
-pip install -r "$TAGAT_ROOT/requirements.txt"
-
-# ── Verificar instalación ─────────────────────────────────────
+echo "  ✅ Librerías de Deep Learning instaladas."
 echo ""
-echo "[CHECK] Verificando instalación..."
-python -c "
-import torch, torch_geometric
-print(f'  PyTorch          : {torch.__version__}')
-print(f'  CUDA disponible  : {torch.cuda.is_available()}')
-print(f'  PyG              : {torch_geometric.__version__}')
-import pydeseq2, GEOparse, networkx, sklearn, scipy
-print('  pydeseq2 / GEOparse / networkx / sklearn / scipy : OK')
-"
+
+# 4. Instalar el resto de dependencias
+echo "[4/4] Instalando dependencias del proyecto..."
+pip install -r "$TAGAT_ROOT/requirements.txt"
+echo ""
+
+# ── Verificación final ────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────"
+echo "  VERIFICACIÓN FINAL"
+echo "─────────────────────────────────────────────────────────"
+python - <<'PYCHECK'
+import sys
+print(f"  Python       : {sys.version.split()[0]}")
+import torch
+print(f"  PyTorch      : {torch.__version__}")
+print(f"  CUDA OK      : {torch.cuda.is_available()}")
+import torch_geometric
+print(f"  PyG          : {torch_geometric.__version__}")
+PYCHECK
 
 echo ""
 echo "============================================================"
-echo "  Entorno '$ENV_NAME' creado correctamente."
-echo "  Actívalo con:  conda activate $ENV_NAME"
+echo "  Configuración completada con éxito."
+echo "  Entorno virtual listo en: $ENV_DIR"
+echo "  Para activarlo manualmente:"
+echo "    source $ENV_DIR/bin/activate"
 echo "============================================================"

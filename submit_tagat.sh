@@ -10,18 +10,18 @@
 #    sbatch --array=0-3 submit_tagat.sh
 #############################################################
 
-# ── Recursos del trabajo ─────────────────────────────────────
+# ── Recursos del trabajo (Optimizado para entrar rápido en cola) ────
 #SBATCH --job-name=TA-GAT
 #SBATCH --output=logs/tagat_%j_%x.out
 #SBATCH --error=logs/tagat_%j_%x.err
-#SBATCH --time=08:00:00          # 8 h máx por dataset (con 3 seeds en modo full)
+#SBATCH --time=03:00:00          # Reducido a 3h (suficiente para run completo de 3 seeds)
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8        # PyDESeq2 usa hasta N_CPUS=6; +2 de margen
-#SBATCH --mem=64G                # pico RAM del pipeline ~30-40 GB
-#SBATCH --gres=gpu:1             # 1 GPU para el entrenamiento GATv2
-#SBATCH --partition=gpu          # ajusta si la partición GPU tiene otro nombre en el CICA
-##SBATCH --account=TU_CUENTA    # descomenta si el CICA requiere cuenta de proyecto
+#SBATCH --cpus-per-task=4        # Reducido a 4 cores (prioridad alta)
+#SBATCH --mem=32G                # Reducido a 32G (suficiente para DESeq2)
+#SBATCH --gres=gpu:1             # 1 GPU para aceleración GATv2
+#SBATCH --partition=gpu          # Partición GPU de Hércules
+##SBATCH --account=TU_CUENTA    # Descomenta si es obligatorio en el CICA
 
 # ── Array de datasets disponibles ────────────────────────────
 DATASETS=(
@@ -49,9 +49,8 @@ echo "  Nodo    : $SLURMD_NODENAME"
 echo "  Fecha   : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
-# ── Directorio raíz del proyecto ─────────────────────────────
-# IMPORTANTE: Ajusta esta ruta a donde subiste el proyecto
-TAGAT_ROOT="$HOME/TA-GAT"
+# ── Directorio raíz del proyecto (auto-detectado desde la ubicación del script) ──
+TAGAT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$TAGAT_ROOT" || { echo "[ERROR] No se encontró $TAGAT_ROOT"; exit 1; }
 
 # Crear directorios necesarios
@@ -59,15 +58,17 @@ mkdir -p "$TAGAT_ROOT/new_implementation/logs"
 mkdir -p "$TAGAT_ROOT/new_implementation/out"
 
 # ── Cargar módulos del sistema ────────────────────────────────
-# Ver módulos disponibles con: module avail
-# Ajusta las versiones a las instaladas en el CICA
-module purge
-module load CUDA/12.1.0           # o la versión disponible (ver: nvidia-smi)
-module load Anaconda3/2023.09-0   # o el módulo conda disponible
+module load Python/3.11.5-GCCcore-13.2.0
 
-# ── Activar entorno conda ─────────────────────────────────────
-# El entorno debe estar creado previamente con setup_env_cica.sh
-conda activate tagat_env
+# ── Activar entorno virtual venv ──────────────────────────────
+if [ -d "$HOME/tagat_env_venv" ]; then
+    echo "  -> Activando entorno virtual venv desde $HOME..."
+    source "$HOME/tagat_env_venv/bin/activate"
+else
+    echo "  ❌ ERROR: No se encontró el entorno virtual en $HOME/tagat_env_venv"
+    echo "     Ejecuta primero: bash setup_env_cica.sh"
+    exit 1
+fi
 
 # ── Verificar GPU disponible ──────────────────────────────────
 echo ""
@@ -87,9 +88,9 @@ echo ""
 # ── Variables de entorno para el pipeline ────────────────────
 export LOCAL_DATASET="$DATASET_NAME"   # activa modo automático (no interactivo)
 export PYTHONPATH="$TAGAT_ROOT:$PYTHONPATH"
-export OMP_NUM_THREADS=8
-export MKL_NUM_THREADS=8
-export OPENBLAS_NUM_THREADS=8
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
 export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 

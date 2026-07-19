@@ -90,7 +90,7 @@ class Config:
     MIN_TOTAL_COUNTS_PER_GENE = 10
     ALPHA = 0.05
     LOG2FC_THRESH = 0.58       
-    N_CPUS = 6  # FIX: raised from 4. M4 has 4 perf + 6 eff cores; 6 avoids thrashing.
+    N_CPUS = 4  # Ajustado a 4 cores para mayor prioridad en la cola de Hércules (HPC)
     
     BIOGRID_URL = "https://downloads.thebiogrid.org/Download/BioGRID/Release-Archive/BIOGRID-4.4.227/BIOGRID-ORGANISM-4.4.227.tab3.zip"
     BIOGRID_FILE_MATCH = "BIOGRID-ORGANISM-Homo_sapiens"
