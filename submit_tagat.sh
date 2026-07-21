@@ -10,17 +10,16 @@
 #    sbatch --array=0-3 submit_tagat.sh
 #############################################################
 
-# ── Recursos del trabajo (Optimizado para entrar rápido en cola) ────
+# ── Recursos del trabajo (CPU-only: sin cola GPU, acceso más rápido) ───
 #SBATCH --job-name=TA-GAT
 #SBATCH --output=logs/tagat_%j_%x.out
 #SBATCH --error=logs/tagat_%j_%x.err
-#SBATCH --time=03:00:00          # Reducido a 3h (suficiente para run completo de 3 seeds)
+#SBATCH --time=00:35:00          # 35 min — suficiente para un run CPU completo
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4        # Reducido a 4 cores (prioridad alta)
-#SBATCH --mem=32G                # Reducido a 32G (suficiente para DESeq2)
-#SBATCH --gres=gpu:1             # 1 GPU para aceleración GATv2
-#SBATCH --partition=gpu          # Partición GPU de Hércules
+#SBATCH --cpus-per-task=8        # 8 cores CPU (PyDESeq2 + operaciones numpy)
+#SBATCH --mem=64G                # 64 GB RAM (sin GPU, todo va a RAM)
+#SBATCH --partition=standard     # Partición CPU de CICA (50 nodos idle, sin cola GPU)
 ##SBATCH --account=TU_CUENTA    # Descomenta si es obligatorio en el CICA
 
 # ── Array de datasets disponibles ────────────────────────────
@@ -49,8 +48,12 @@ echo "  Nodo    : $SLURMD_NODENAME"
 echo "  Fecha   : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
-# ── Directorio raíz del proyecto (auto-detectado desde la ubicación del script) ──
-TAGAT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── Directorio raíz del proyecto ─────────────────────────────
+# SLURM copia el script a /var/spool/slurmd/jobXXX/ al ejecutar,
+# por lo que BASH_SOURCE[0] apuntaría a ese directorio temporal.
+# SLURM_SUBMIT_DIR siempre contiene el directorio original del sbatch.
+TAGAT_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+echo "  -> TAGAT_ROOT: $TAGAT_ROOT"
 cd "$TAGAT_ROOT" || { echo "[ERROR] No se encontró $TAGAT_ROOT"; exit 1; }
 
 # Crear directorios necesarios
@@ -70,29 +73,26 @@ else
     exit 1
 fi
 
-# ── Verificar GPU disponible ──────────────────────────────────
+# ── Verificar entorno CPU ─────────────────────────────────────
 echo ""
-echo "[GPU] Dispositivos disponibles:"
-nvidia-smi --query-gpu=name,memory.total,driver_version \
-    --format=csv,noheader 2>/dev/null || echo "  (nvidia-smi no disponible)"
+echo "[CPU] Entorno de cómputo:"
 python -c "
-import torch
+import torch, os
 print(f'  PyTorch  : {torch.__version__}')
-print(f'  CUDA OK  : {torch.cuda.is_available()}')
-if torch.cuda.is_available():
-    print(f'  GPU      : {torch.cuda.get_device_name(0)}')
-    print(f'  VRAM     : {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB')
+print(f'  Device   : CPU (forzado)')
+print(f'  Threads  : {torch.get_num_threads()}')
+print(f'  CUDA     : {torch.cuda.is_available()} (no se usará)')
 "
 echo ""
 
 # ── Variables de entorno para el pipeline ────────────────────
 export LOCAL_DATASET="$DATASET_NAME"   # activa modo automático (no interactivo)
 export PYTHONPATH="$TAGAT_ROOT:$PYTHONPATH"
-export OMP_NUM_THREADS=4
-export MKL_NUM_THREADS=4
-export OPENBLAS_NUM_THREADS=4
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export CUDA_VISIBLE_DEVICES=""        # Ocultar cualquier GPU — forzar CPU
+export PYTORCH_NO_CUDA=1              # Asegurar que PyTorch no intente usar CUDA
 
 # ── Lanzar pipeline ───────────────────────────────────────────
 echo "[START] Lanzando TA-GAT para: $DATASET_NAME"
